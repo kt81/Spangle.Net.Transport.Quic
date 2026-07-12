@@ -116,6 +116,13 @@ public sealed record QuicServerOptions
 
     /// <summary>How long an idle connection is kept before QUIC closes it.</summary>
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How many inbound streams a peer may have open at once. QUIC defaults this to 0, which
+    /// makes AcceptStreamAsync fail, so both directions are granted this credit. MoQ opens
+    /// a control stream plus a data stream per subgroup, so the default is generous.
+    /// </summary>
+    public int MaxConcurrentInboundStreams { get; init; } = 128;
 }
 
 /// <summary>Everything a backend needs to dial a peer.</summary>
@@ -135,4 +142,10 @@ public sealed record QuicClientOptions
 
     /// <summary>How long an idle connection is kept before QUIC closes it.</summary>
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How many inbound streams the server may have open at once. QUIC defaults this to 0,
+    /// which makes AcceptStreamAsync fail, so both directions are granted this credit.
+    /// </summary>
+    public int MaxConcurrentInboundStreams { get; init; } = 128;
 }

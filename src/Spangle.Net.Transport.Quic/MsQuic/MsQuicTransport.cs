@@ -40,6 +40,8 @@ public sealed class MsQuicTransport : IQuicTransport
                 DefaultStreamErrorCode = 0,
                 DefaultCloseErrorCode = 0,
                 IdleTimeout = options.IdleTimeout,
+                MaxInboundUnidirectionalStreams = options.MaxConcurrentInboundStreams,
+                MaxInboundBidirectionalStreams = options.MaxConcurrentInboundStreams,
                 ServerAuthenticationOptions = new SslServerAuthenticationOptions
                 {
                     ApplicationProtocols = protocols,
@@ -81,6 +83,8 @@ public sealed class MsQuicTransport : IQuicTransport
             DefaultStreamErrorCode = 0,
             DefaultCloseErrorCode = 0,
             IdleTimeout = options.IdleTimeout,
+            MaxInboundUnidirectionalStreams = options.MaxConcurrentInboundStreams,
+            MaxInboundBidirectionalStreams = options.MaxConcurrentInboundStreams,
             ClientAuthenticationOptions = clientAuthentication,
         };
 

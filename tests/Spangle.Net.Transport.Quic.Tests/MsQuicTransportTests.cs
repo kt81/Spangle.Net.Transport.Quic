@@ -102,6 +102,54 @@ public class MsQuicTransportTests
         received.Should().Equal(payload);
     }
 
+    [Fact]
+    public async Task Loopback_ClientAcceptsServerOpenedStream_WhenSupported()
+    {
+        if (!MsQuicTransport.Shared.IsSupported)
+        {
+            return; // covered by the in-memory backend where QUIC cannot run
+        }
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        CancellationToken ct = cts.Token;
+        IQuicTransport transport = MsQuicTransport.Shared;
+
+        using X509Certificate2 certificate = CreateSelfSignedCertificate();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Moq],
+            ServerCertificate = certificate,
+        }, ct);
+
+        ValueTask<IQuicConnection> acceptTask = server.AcceptConnectionAsync(ct);
+        await using IQuicConnection client = await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Moq],
+            TargetHost = "localhost",
+            AllowUntrustedCertificates = true,
+        }, ct);
+        await using IQuicConnection accepted = await acceptTask;
+
+        // The server opens the stream and the client accepts it — the direction that needs
+        // the client's inbound-stream credit (QUIC defaults it to 0, which used to throw).
+        byte[] payload = Encoding.UTF8.GetBytes("server to client");
+        await using IQuicStream send = await accepted.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        await send.WriteAsync(payload, completeWrites: true, ct);
+        await using IQuicStream recv = await client.AcceptStreamAsync(ct);
+
+        var received = new List<byte>();
+        var buffer = new byte[256];
+        int read;
+        while ((read = await recv.ReadAsync(buffer, ct)) != 0)
+        {
+            received.AddRange(buffer[..read]);
+        }
+
+        received.Should().Equal(payload);
+    }
+
     private static X509Certificate2 CreateSelfSignedCertificate()
     {
         using var rsa = RSA.Create(2048);
