@@ -98,14 +98,40 @@ public static class KeyValuePairCodec
         ulong previousType = 0;
         while (!reader.End)
         {
-            ulong type = previousType + reader.ReadVarInt();
-            previousType = type;
-
-            pairs.Add((type & 1UL) == 0UL
-                ? MoqKeyValuePair.Varint(type, reader.ReadVarInt())
-                : MoqKeyValuePair.FromBytes(type, reader.ReadBytes()));
+            pairs.Add(ReadOne(ref reader, ref previousType));
         }
 
         return pairs;
+    }
+
+    /// <summary>Writes a varint count followed by the pairs (a counted parameter list).</summary>
+    public static void WriteCounted(MoqWriter writer, IReadOnlyList<MoqKeyValuePair> pairs)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(pairs);
+        writer.WriteVarInt((ulong)pairs.Count);
+        WriteList(writer, pairs);
+    }
+
+    /// <summary>Reads exactly <paramref name="count"/> pairs.</summary>
+    public static IReadOnlyList<MoqKeyValuePair> ReadCounted(ref MoqReader reader, int count)
+    {
+        var pairs = new List<MoqKeyValuePair>(count);
+        ulong previousType = 0;
+        for (int i = 0; i < count; i++)
+        {
+            pairs.Add(ReadOne(ref reader, ref previousType));
+        }
+
+        return pairs;
+    }
+
+    private static MoqKeyValuePair ReadOne(ref MoqReader reader, ref ulong previousType)
+    {
+        ulong type = previousType + reader.ReadVarInt();
+        previousType = type;
+        return (type & 1UL) == 0UL
+            ? MoqKeyValuePair.Varint(type, reader.ReadVarInt())
+            : MoqKeyValuePair.FromBytes(type, reader.ReadBytes());
     }
 }
