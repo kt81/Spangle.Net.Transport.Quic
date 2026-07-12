@@ -1,0 +1,25 @@
+## .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+project.lock.json
+.vs/
+.vscode/
+.idea/
+
+## Test / coverage
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Native msquic dropped by the fetch script for local runs (never committed)
+runtimes/**/native/libmsquic.*
+runtimes/**/native/msquic.*

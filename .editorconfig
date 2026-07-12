@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+trim_trailing_whitespace = true
+
+[*.{cs}]
+indent_size = 4
+
+# --- Analyzer rule tunings, each with a written reason (the Spangle house rule) ---
+[*.cs]
+
+# CA1711: "Stream" is a reserved type-name suffix, but in QUIC the *stream* is the
+# protocol's own name for its data channel. IQuicStream / MsQuicStream / InMemoryQuicStream
+# model a QUIC stream, not a System.IO.Stream, and renaming them away from the spec term
+# would obscure the mapping. Allowed deliberately.
+dotnet_diagnostic.CA1711.severity = none
+
+# MA0048: the transport contract (IQuicTransport + IQuicServer/Connection/Stream + options)
+# and each backend's small wrapper trio read as one unit; grouping them per role is clearer
+# than a file per interface. Same house style as the Spangle server.
+dotnet_diagnostic.MA0048.severity = none
+
+[*.{csproj,props,targets}]
+indent_size = 2
+
+[*.{json,yml,yaml}]
+indent_size = 2
