@@ -10,29 +10,56 @@ trim_trailing_whitespace = true
 [*.{cs}]
 indent_size = 4
 
-# --- Analyzer rule tunings, each with a written reason (the Spangle house rule) ---
+# ---------------------------------------------------------------------------
+# Analyzers run at full power (latest-all + Meziantou + VS Threading, warnings
+# are errors — see Directory.Build.props), matching the Spangle server. Everything
+# is ON by default; the rules below are the deliberate exceptions, each with its
+# reason. Do not add entries here without one.
+# ---------------------------------------------------------------------------
 [*.cs]
 
-# CA1711: "Stream" is a reserved type-name suffix, but in QUIC the *stream* is the
-# protocol's own name for its data channel. IQuicStream / MsQuicStream / InMemoryQuicStream
-# model a QUIC stream, not a System.IO.Stream, and renaming them away from the spec term
-# would obscure the mapping. Allowed deliberately.
-dotnet_diagnostic.CA1711.severity = none
-
-# MA0048: the transport contract (IQuicTransport + IQuicServer/Connection/Stream + options)
-# and each backend's small wrapper trio read as one unit; grouping them per role is clearer
-# than a file per interface. Same house style as the Spangle server.
+# The transport contract (IQuicTransport + server/connection/stream) and each
+# backend's small wrapper trio read as one unit; the MOQT wire types sit beside
+# their codec. "Read like the spec" beats file-per-type here.
 dotnet_diagnostic.MA0048.severity = none
 
-# CA1062: nullable reference types are enabled, so a non-nullable parameter already declares
-# "not null" as its contract; the few places that genuinely accept external input validate
-# explicitly with ArgumentNullException.ThrowIfNull. Same choice as the Spangle server.
+# Protocol codecs and control flow are deliberately linear so they read
+# top-to-bottom against the draft; splitting them would obscure the flow.
+dotnet_diagnostic.MA0051.severity = none
+
+# Nullable reference types are enabled repo-wide; the compiler enforces the null
+# contract, so re-validating every public argument at runtime is noise.
 dotnet_diagnostic.CA1062.severity = none
 
-# CA1815: the small wire value types (e.g. MoqKeyValuePair) are one-way DTOs carried through
-# the codec, never used as dictionary keys or compared for equality, so value-equality
-# overrides would be dead code. Same choice as the Spangle server.
+# Small wire value types (MoqKeyValuePair, SubgroupHeader) are one-way DTOs
+# carried through the codec, never compared for equality; equality members would
+# be dead weight.
 dotnet_diagnostic.CA1815.severity = none
+
+# Enums mirror MOQT wire tables verbatim (draft-18): Reserved entries keep their
+# spec names (CA1700), spec tables carry aliased values (CA1069), the width is
+# protocol-mandated (CA1028), and a fabricated None=0 member would misrepresent
+# the spec (CA1008, MA0099).
+dotnet_diagnostic.CA1700.severity = none
+dotnet_diagnostic.CA1069.severity = none
+dotnet_diagnostic.CA1028.severity = none
+dotnet_diagnostic.CA1008.severity = none
+dotnet_diagnostic.MA0099.severity = none
+
+# Session/stream boundaries catch broadly on purpose: one peer's failure must not
+# take the connection down. Every such site reports.
+dotnet_diagnostic.CA1031.severity = none
+
+# TODO markers are the owner's WIP workflow, tracked in the roadmap.
+dotnet_diagnostic.MA0026.severity = none
+
+# CA1711 stays ON; "Stream" is allowed because in QUIC the *stream* is the
+# protocol's own name for its data channel — IQuicStream / SubgroupStreamReader
+# model a QUIC stream, not a System.IO.Stream.
+dotnet_code_quality.ca1711.allowed_suffixes = Stream
+
+# Unused usings fail the build (needs GenerateDocumentationFile, see props).
+dotnet_diagnostic.IDE0005.severity = warning
 
 [*.{csproj,props,targets}]
 indent_size = 2

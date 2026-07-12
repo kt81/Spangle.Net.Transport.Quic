@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Security;
 using System.Text;
-using Spangle.Net.Transport.Quic;
 using Spangle.Net.Transport.Quic.InMemory;
 
 namespace Spangle.Net.Transport.Quic.Tests;

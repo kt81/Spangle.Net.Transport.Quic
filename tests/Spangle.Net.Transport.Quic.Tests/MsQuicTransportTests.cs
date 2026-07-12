@@ -3,7 +3,6 @@ using System.Net.Security;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Spangle.Net.Transport.Quic;
 using Spangle.Net.Transport.Quic.MsQuic;
 
 namespace Spangle.Net.Transport.Quic.Tests;
