@@ -43,6 +43,22 @@ The protocol shape
 end — SUBSCRIBE → SUBSCRIBE_OK → objects on the assigned alias — and reads as a narrative of
 the flow.
 
+**Receiving streams without touching the wire.** After the handshake, a peer just accepts
+streams; [`MoqStreamRouter`](src/Spangle.Net.Moqt/MoqStreamRouter.cs) classifies each one so
+the caller never reads a stream-type varint by hand:
+
+```csharp
+switch (await MoqStreamRouter.AcceptAsync(connection, ct))
+{
+    case MoqRequestStream req when req.MessageType == MoqControlMessageType.Subscribe:
+        var subscribe = SubscribeMessage.DecodePayload(req.Payload.Span); // reply on req.Stream
+        break;
+    case MoqSubgroupStream sub:
+        while (await sub.Reader.ReadObjectAsync(ct) is { } obj) { /* obj.Payload ... */ }
+        break;
+}
+```
+
 The QUIC seam
 -------------
 
