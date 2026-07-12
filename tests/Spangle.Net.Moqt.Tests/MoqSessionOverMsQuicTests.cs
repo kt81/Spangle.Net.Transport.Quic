@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Security;
-using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Spangle.Net.Moqt;
@@ -34,7 +33,7 @@ public class MoqSessionOverMsQuicTests
         CancellationToken ct = cts.Token;
         IQuicTransport transport = MsQuicTransport.Shared;
 
-        using X509Certificate2 certificate = CreateSelfSignedCertificate();
+        using X509Certificate2 certificate = TestCertificates.CreateSelfSigned();
         await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
         {
             ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
@@ -66,21 +65,5 @@ public class MoqSessionOverMsQuicTests
             o => o.Type == MoqSetupOption.MoqtImplementation).Bytes).Should().Be("spangle");
         serverSession.RemoteSetup.Options.Single(
             o => o.Type == MoqSetupOption.MaxRequestUpdates).VarintValue.Should().Be(64UL);
-    }
-
-    private static X509Certificate2 CreateSelfSignedCertificate()
-    {
-        using var rsa = RSA.Create(2048);
-        var request = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        request.CertificateExtensions.Add(
-            new X509EnhancedKeyUsageExtension([new Oid("1.3.6.1.5.5.7.3.1")], critical: false));
-        var subjectAlternativeName = new SubjectAlternativeNameBuilder();
-        subjectAlternativeName.AddDnsName("localhost");
-        request.CertificateExtensions.Add(subjectAlternativeName.Build());
-
-        using X509Certificate2 ephemeral = request.CreateSelfSigned(
-            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
-        byte[] pfx = ephemeral.Export(X509ContentType.Pfx);
-        return X509CertificateLoader.LoadPkcs12(pfx, password: null, keyStorageFlags: X509KeyStorageFlags.Exportable);
     }
 }
