@@ -29,6 +29,11 @@ dotnet_diagnostic.MA0048.severity = none
 # explicitly with ArgumentNullException.ThrowIfNull. Same choice as the Spangle server.
 dotnet_diagnostic.CA1062.severity = none
 
+# CA1815: the small wire value types (e.g. MoqKeyValuePair) are one-way DTOs carried through
+# the codec, never used as dictionary keys or compared for equality, so value-equality
+# overrides would be dead code. Same choice as the Spangle server.
+dotnet_diagnostic.CA1815.severity = none
+
 [*.{csproj,props,targets}]
 indent_size = 2
 
