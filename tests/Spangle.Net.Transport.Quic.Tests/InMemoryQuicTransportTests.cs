@@ -114,17 +114,18 @@ public class InMemoryQuicTransportTests
         {
             byte[] payload = Encoding.UTF8.GetBytes("hello over an object stream");
 
-            ValueTask<IQuicStream> acceptTask = accepted.AcceptStreamAsync(ct);
             IQuicStream send = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
-            IQuicStream recv = await acceptTask;
-
             send.CanWrite.Should().BeTrue();
             send.CanRead.Should().BeFalse();
+
+            // real QUIC surfaces the stream to the peer only once the opener writes to it
+            await send.WriteAsync(payload, completeWrites: true, ct);
+
+            IQuicStream recv = await accepted.AcceptStreamAsync(ct);
             recv.CanRead.Should().BeTrue();
             recv.CanWrite.Should().BeFalse();
             recv.Direction.Should().Be(QuicStreamDirection.Unidirectional);
 
-            await send.WriteAsync(payload, completeWrites: true, ct);
             byte[] received = await ReadToEndAsync(recv, ct);
 
             received.Should().Equal(payload);
@@ -143,15 +144,14 @@ public class InMemoryQuicTransportTests
         await using (client)
         await using (accepted)
         {
-            ValueTask<IQuicStream> acceptTask = accepted.AcceptStreamAsync(ct);
             IQuicStream clientStream = await client.OpenStreamAsync(QuicStreamDirection.Bidirectional, ct);
-            IQuicStream serverStream = await acceptTask;
-
             clientStream.CanRead.Should().BeTrue();
             clientStream.CanWrite.Should().BeTrue();
 
             byte[] request = Encoding.UTF8.GetBytes("ping");
             await clientStream.WriteAsync(request, completeWrites: true, ct);
+
+            IQuicStream serverStream = await accepted.AcceptStreamAsync(ct);
             byte[] serverGot = await ReadToEndAsync(serverStream, ct);
             serverGot.Should().Equal(request);
 
@@ -180,13 +180,14 @@ public class InMemoryQuicTransportTests
                 payload[i] = (byte)(i * 31 + 7);
             }
 
-            ValueTask<IQuicStream> acceptTask = accepted.AcceptStreamAsync(ct);
             IQuicStream send = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
-            IQuicStream recv = await acceptTask;
 
-            // reader and writer run concurrently so pipe backpressure is actually exercised
+            // start the write first (it surfaces the stream to the peer and blocks on
+            // backpressure), then accept and drain concurrently so the write can complete
+            Task write = send.WriteAsync(payload, completeWrites: true, ct).AsTask();
+            IQuicStream recv = await accepted.AcceptStreamAsync(ct);
             Task<byte[]> reader = ReadToEndAsync(recv, ct);
-            await send.WriteAsync(payload, completeWrites: true, ct);
+            await write;
             byte[] received = await reader;
 
             received.Should().Equal(payload);
@@ -205,11 +206,10 @@ public class InMemoryQuicTransportTests
         await using (client)
         await using (accepted)
         {
-            ValueTask<IQuicStream> acceptTask = accepted.AcceptStreamAsync(ct);
             IQuicStream send = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
-            IQuicStream recv = await acceptTask;
-
             await send.WriteAsync(Encoding.UTF8.GetBytes("partial"), completeWrites: false, ct);
+
+            IQuicStream recv = await accepted.AcceptStreamAsync(ct);
             send.Abort(errorCode: 42);
 
             Func<Task> readAll = async () =>

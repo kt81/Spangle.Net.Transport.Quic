@@ -178,23 +178,31 @@ public sealed class InMemoryQuicConnection : IQuicConnection
         if (direction == QuicStreamDirection.Unidirectional)
         {
             var pipe = new Pipe();
-            local = new InMemoryQuicStream(id, direction, inbound: null, outbound: pipe.Writer);
             remote = new InMemoryQuicStream(id, direction, inbound: pipe.Reader, outbound: null);
+            local = new InMemoryQuicStream(id, direction, inbound: null, outbound: pipe.Writer,
+                onActivate: () => PublishInboundStream(remote));
         }
         else
         {
             var toAcceptor = new Pipe();
             var toOpener = new Pipe();
-            local = new InMemoryQuicStream(id, direction, inbound: toOpener.Reader, outbound: toAcceptor.Writer);
             remote = new InMemoryQuicStream(id, direction, inbound: toAcceptor.Reader, outbound: toOpener.Writer);
+            local = new InMemoryQuicStream(id, direction, inbound: toOpener.Reader, outbound: toAcceptor.Writer,
+                onActivate: () => PublishInboundStream(remote));
         }
 
-        if (!_peer._incomingStreams.Writer.TryWrite(remote))
+        // Like real QUIC, the peer does not see the stream until the opener first writes to it
+        // (or completes/aborts it); OpenStreamAsync alone is invisible on the wire. The remote
+        // half is published on that first activation, not here.
+        return ValueTask.FromResult<IQuicStream>(local);
+    }
+
+    private void PublishInboundStream(InMemoryQuicStream stream)
+    {
+        if (!_peer._incomingStreams.Writer.TryWrite(stream))
         {
             throw new InvalidOperationException("The peer connection is closed.");
         }
-
-        return ValueTask.FromResult<IQuicStream>(local);
     }
 
     /// <inheritdoc />
@@ -234,15 +242,22 @@ public sealed class InMemoryQuicStream : IQuicStream
 {
     private readonly PipeReader? _inbound;
     private readonly PipeWriter? _outbound;
+    private Action? _onActivate;
     private bool _writesCompleted;
 
-    internal InMemoryQuicStream(long id, QuicStreamDirection direction, PipeReader? inbound, PipeWriter? outbound)
+    internal InMemoryQuicStream(long id, QuicStreamDirection direction, PipeReader? inbound, PipeWriter? outbound,
+        Action? onActivate = null)
     {
         Id = id;
         Direction = direction;
         _inbound = inbound;
         _outbound = outbound;
+        _onActivate = onActivate;
     }
+
+    // Runs once, on the first write/complete/abort, to make the stream visible to the peer —
+    // mirroring QUIC, where opening a stream sends nothing until the first STREAM frame.
+    private void Activate() => Interlocked.Exchange(ref _onActivate, null)?.Invoke();
 
     /// <inheritdoc />
     public long Id { get; }
@@ -292,6 +307,7 @@ public sealed class InMemoryQuicStream : IQuicStream
             throw new InvalidOperationException("This stream half is read-only.");
         }
 
+        Activate();
         if (!buffer.IsEmpty)
         {
             await _outbound.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -311,6 +327,7 @@ public sealed class InMemoryQuicStream : IQuicStream
     /// <inheritdoc />
     public void CompleteWrites()
     {
+        Activate();
         if (_writesCompleted || _outbound is null)
         {
             return;
@@ -323,6 +340,7 @@ public sealed class InMemoryQuicStream : IQuicStream
     /// <inheritdoc />
     public void Abort(long errorCode)
     {
+        Activate();
         var reset = new IOException($"Stream aborted (error {errorCode}).");
         _outbound?.Complete(reset);
         _inbound?.Complete(reset);

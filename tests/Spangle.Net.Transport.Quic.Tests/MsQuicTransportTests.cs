@@ -85,11 +85,11 @@ public class MsQuicTransportTests
         client.NegotiatedApplicationProtocol.Should().Be(Moq);
 
         byte[] payload = Encoding.UTF8.GetBytes("real quic roundtrip");
-        ValueTask<IQuicStream> serverAccept = accepted.AcceptStreamAsync(ct);
         await using IQuicStream send = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
-        await using IQuicStream recv = await serverAccept;
 
+        // QUIC surfaces the stream to the peer only once the opener writes, so write first
         await send.WriteAsync(payload, completeWrites: true, ct);
+        await using IQuicStream recv = await accepted.AcceptStreamAsync(ct);
 
         var received = new List<byte>();
         var buffer = new byte[256];
@@ -108,6 +108,19 @@ public class MsQuicTransportTests
         var request = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         request.CertificateExtensions.Add(
             new X509EnhancedKeyUsageExtension([new Oid("1.3.6.1.5.5.7.3.1")], critical: false)); // server auth
-        return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
+        var subjectAlternativeName = new SubjectAlternativeNameBuilder();
+        subjectAlternativeName.AddDnsName("localhost");
+        request.CertificateExtensions.Add(subjectAlternativeName.Build());
+
+        using X509Certificate2 ephemeral = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
+
+        // Export and reimport so the private key lives in a store Schannel/msquic can use
+        // for server authentication on Windows. The ephemeral key from CreateSelfSigned is
+        // otherwise unusable there and the server aborts the handshake, which the client
+        // sees as a 'UserCanceled' TLS alert.
+        byte[] pfx = ephemeral.Export(X509ContentType.Pfx);
+        return X509CertificateLoader.LoadPkcs12(pfx, password: null,
+            keyStorageFlags: X509KeyStorageFlags.Exportable);
     }
 }
