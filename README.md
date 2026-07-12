@@ -1,6 +1,8 @@
 Spangle.Net.Transport.Quic
 ==========================
 
+[![Build and Test](https://github.com/kt81/Spangle.Net.Transport.Quic/actions/workflows/build_test.yml/badge.svg)](https://github.com/kt81/Spangle.Net.Transport.Quic/actions/workflows/build_test.yml)
+
 The QUIC transport seam for [Spangle](https://github.com/kt81/spangle) — the layer that
 keeps Spangle's QUIC-based protocols (Media over QUIC first) off `System.Net.Quic`
 directly, so the protocol code has one interface to target and two interchangeable
@@ -46,6 +48,17 @@ On **Windows**, msquic ships with the OS / runtime — nothing to install. On **
 packages.microsoft.com, or bundle it per-RID with the app for a portable binary. Because
 there is only one `System.Net.Quic` in a process, that single `libmsquic` is shared with
 Kestrel's HTTP/3 and WebTransport — the transport never runs two msquic binaries.
+
+Testing
+-------
+
+The in-memory backend runs anywhere, so the abstraction and any protocol built on it are
+covered on every platform with no native dependency. The real `MsQuicTransport` can only be
+exercised where QUIC actually runs, so its loopback test runs when `IsSupported` is true and
+skips otherwise. CI closes the gap: the Windows job sets `SPANGLE_REQUIRE_QUIC=1`, which turns
+a skip into a failure — guaranteeing the real msquic backend is exercised on every push. The
+Linux job installs `libmsquic` and runs it best-effort; the macOS (arm64) job covers the
+managed logic and the build.
 
 License
 -------

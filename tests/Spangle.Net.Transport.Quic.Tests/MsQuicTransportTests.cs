@@ -19,6 +19,23 @@ public class MsQuicTransportTests
     private static readonly SslApplicationProtocol Moq = new("moq-echo");
 
     [Fact]
+    public void IsSupported_WhenRequiredByEnvironment_MustBeTrue()
+    {
+        // CI sets SPANGLE_REQUIRE_QUIC on jobs that must exercise the real backend
+        // (e.g. Windows, where msquic is in-box). Without this, every job could silently
+        // skip the loopback test and the suite would go green having never touched msquic.
+        string? require = Environment.GetEnvironmentVariable("SPANGLE_REQUIRE_QUIC");
+        if (!string.Equals(require, "1", StringComparison.Ordinal)
+            && !string.Equals(require, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        MsQuicTransport.Shared.IsSupported.Should().BeTrue(
+            "SPANGLE_REQUIRE_QUIC is set, so this platform must be able to run the real msquic backend");
+    }
+
+    [Fact]
     public async Task Unsupported_Platform_ThrowsPlatformNotSupported()
     {
         if (MsQuicTransport.Shared.IsSupported)

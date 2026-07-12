@@ -1,0 +1,59 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows ships msquic in-box and has IPv6, so the real backend is guaranteed
+          # to run here — SPANGLE_REQUIRE_QUIC makes the suite fail if it somehow cannot,
+          # instead of silently skipping the loopback test and going green.
+          - os: windows-latest
+            require_quic: "1"
+          # Linux: install libmsquic and run the real backend best-effort (it runs only if
+          # the runner also has the IPv6/dual-mode sockets System.Net.Quic needs).
+          - os: ubuntu-latest
+            require_quic: ""
+          # macOS is arm64 (Apple Silicon); Intel macOS is unsupported by design. No
+          # packaged libmsquic here, so this job covers the managed logic and the arm64 build.
+          - os: macos-latest
+            require_quic: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install libmsquic (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSL https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -o packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install -y libmsquic
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        env:
+          SPANGLE_REQUIRE_QUIC: ${{ matrix.require_quic }}
+        run: dotnet test --no-build --configuration Release --verbosity normal
