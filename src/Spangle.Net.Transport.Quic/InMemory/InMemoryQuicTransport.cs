@@ -139,13 +139,11 @@ public sealed class InMemoryQuicConnection : IQuicConnection
         Justification = "The peer is the other end of the pair, owned by its own receiver; a connection never disposes its peer.")]
     private InMemoryQuicConnection _peer = null!;
     private long _nextStreamId;
-    private readonly bool _isClient;
 
     internal InMemoryQuicConnection(EndPoint remoteEndPoint, SslApplicationProtocol negotiated)
     {
         RemoteEndPoint = remoteEndPoint;
         NegotiatedApplicationProtocol = negotiated;
-        _isClient = false;
     }
 
     /// <inheritdoc />
@@ -232,7 +230,6 @@ public sealed class InMemoryQuicConnection : IQuicConnection
     public ValueTask DisposeAsync()
     {
         _incomingStreams.Writer.TryComplete();
-        _ = _isClient; // reserved for future asymmetric behavior; kept for clarity of role
         return ValueTask.CompletedTask;
     }
 }

@@ -29,6 +29,60 @@ public class SubgroupStreamTests
     }
 
     [Fact]
+    public async Task SubgroupStream_FirstObjectAndInheritedPriority_RoundTripWithNoExtraFields()
+    {
+        // FIRST_OBJECT is a semantic bit (draft-18 §2.2) that adds no header field, and
+        // DEFAULT_PRIORITY omits the priority byte. With both set, the object must still parse
+        // — proving the reader consumes exactly the fields the type selects and none extra.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        ValueTask<IQuicConnection> acceptTask = server.AcceptConnectionAsync(ct);
+        await using IQuicConnection clientConn = await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        await using IQuicConnection serverConn = await acceptTask;
+
+        var header = new SubgroupHeader
+        {
+            TrackAlias = 9,
+            GroupId = 4,
+            SubgroupIdMode = SubgroupIdMode.Explicit,
+            SubgroupId = 2,
+            FirstObject = true,
+            InheritPriority = true, // priority byte omitted
+        };
+
+        await using IQuicStream outbound = await clientConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        var writer = new SubgroupStreamWriter(outbound, header);
+        await writer.WriteObjectAsync(MoqObject.Normal(4, 0, 2, 0, Encoding.UTF8.GetBytes("x")), ct);
+        await writer.CompleteAsync(ct);
+
+        await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, ct);
+
+        reader.Header.FirstObject.Should().BeTrue();
+        reader.Header.InheritPriority.Should().BeTrue();
+        reader.Header.TrackAlias.Should().Be(9UL);
+        reader.Header.SubgroupId.Should().Be(2UL);
+
+        MoqObject? first = await reader.ReadObjectAsync(ct);
+        first.Should().NotBeNull();
+        first!.ObjectId.Should().Be(0UL);
+        Encoding.UTF8.GetString(first.Payload.Span).Should().Be("x");
+        (await reader.ReadObjectAsync(ct)).Should().BeNull(); // clean end, nothing miscounted
+    }
+
+    [Fact]
     public async Task SubgroupStream_RoundTripsHeaderAndObjects()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));

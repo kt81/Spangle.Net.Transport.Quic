@@ -40,7 +40,7 @@ public static class ControlMessage
         var firstByte = new byte[1];
         await ReadExactlyAsync(stream, firstByte, cancellationToken).ConfigureAwait(false);
 
-        int typeLength = 1 << (firstByte[0] >> 6);
+        int typeLength = VarInt.GetEncodedLength(firstByte[0]);
         var typeBytes = new byte[typeLength];
         typeBytes[0] = firstByte[0];
         if (typeLength > 1)

@@ -11,6 +11,13 @@ public static class VarInt
     /// <summary>The largest value representable: 2^62 - 1.</summary>
     public const ulong MaxValue = (1UL << 62) - 1;
 
+    /// <summary>
+    /// The encoded length (1, 2, 4, or 8) a var-int occupies, read from its first byte: the
+    /// two most-significant bits select the width. The one place this decode lives, so the
+    /// wire reader, the control-message framer, and the stream reader all agree.
+    /// </summary>
+    public static int GetEncodedLength(byte firstByte) => 1 << (firstByte >> 6);
+
     /// <summary>The number of bytes <paramref name="value"/> encodes to (1, 2, 4, or 8).</summary>
     public static int GetLength(ulong value) => value switch
     {
@@ -35,7 +42,7 @@ public static class VarInt
             return false;
         }
 
-        int length = 1 << (source[0] >> 6); // top two bits: 0->1, 1->2, 2->4, 3->8
+        int length = GetEncodedLength(source[0]);
         if (source.Length < length)
         {
             return false;

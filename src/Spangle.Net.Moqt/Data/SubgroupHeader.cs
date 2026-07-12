@@ -18,21 +18,12 @@ public enum SubgroupIdMode
 }
 
 /// <summary>
-/// The SUBGROUP_HEADER that opens a subgroup data stream (draft-18 §11.4.2). Its type is a
-/// varint whose low bits select which fields follow: the PROPERTIES bit, the two-bit
-/// SUBGROUP_ID_MODE, END_OF_GROUP, DEFAULT_PRIORITY (priority omitted, inherited), and
-/// FIRST_OBJECT. Bit 4 (0x10) is always set.
+/// The SUBGROUP_HEADER that opens a subgroup data stream (draft-18 §11.4.2). Its varint type
+/// selects which fields follow; that bit layout lives in one place, <see cref="SubgroupHeaderType"/>,
+/// which both the <see cref="Type"/> getter and <see cref="ReadAsync"/> go through.
 /// </summary>
 public readonly struct SubgroupHeader
 {
-    private const ulong TypeBase = 0x10;
-    private const ulong PropertiesBit = 0x01;
-    private const ulong SubgroupIdModeMask = 0x06;
-    private const ulong EndOfGroupBit = 0x08;
-    private const ulong TypeRangeBit = 0x10;
-    private const ulong DefaultPriorityBit = 0x20;
-    private const ulong FirstObjectBit = 0x40;
-
     /// <summary>The track this subgroup's objects belong to.</summary>
     public ulong TrackAlias { get; init; }
 
@@ -62,12 +53,7 @@ public readonly struct SubgroupHeader
 
     /// <summary>The varint type value that encodes this header's field layout.</summary>
     public ulong Type =>
-        TypeBase
-        | (HasProperties ? PropertiesBit : 0)
-        | ((ulong)SubgroupIdMode << 1)
-        | (EndOfGroup ? EndOfGroupBit : 0)
-        | (InheritPriority ? DefaultPriorityBit : 0)
-        | (FirstObject ? FirstObjectBit : 0);
+        SubgroupHeaderType.Compose(HasProperties, SubgroupIdMode, EndOfGroup, InheritPriority, FirstObject).Value;
 
     /// <summary>Serializes the header into <paramref name="output"/>.</summary>
     public void WriteTo(IBufferWriter<byte> output)
@@ -96,17 +82,9 @@ public readonly struct SubgroupHeader
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        ulong type = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
-        if ((type & TypeRangeBit) == 0 || type > 0x7F)
-        {
-            throw new MoqProtocolException($"0x{type:X} is not a valid SUBGROUP_HEADER type.");
-        }
-
-        var mode = (SubgroupIdMode)((type & SubgroupIdModeMask) >> 1);
-        if ((int)mode == 3)
-        {
-            throw new MoqProtocolException("SUBGROUP_ID_MODE 0b11 is reserved.");
-        }
+        ulong rawType = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
+        SubgroupHeaderType type = SubgroupHeaderType.Parse(rawType);
+        SubgroupIdMode mode = type.SubgroupIdMode;
 
         ulong trackAlias = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
         ulong groupId = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
@@ -117,7 +95,8 @@ public readonly struct SubgroupHeader
             subgroupId = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
         }
 
-        bool inheritPriority = (type & DefaultPriorityBit) != 0;
+        // FIRST_OBJECT selects no field, so the priority byte follows the Subgroup ID directly.
+        bool inheritPriority = type.InheritPriority;
         byte publisherPriority = 0;
         if (!inheritPriority)
         {
@@ -136,9 +115,9 @@ public readonly struct SubgroupHeader
             GroupId = groupId,
             SubgroupIdMode = mode,
             SubgroupId = subgroupId,
-            HasProperties = (type & PropertiesBit) != 0,
-            EndOfGroup = (type & EndOfGroupBit) != 0,
-            FirstObject = (type & FirstObjectBit) != 0,
+            HasProperties = type.HasProperties,
+            EndOfGroup = type.EndOfGroup,
+            FirstObject = type.FirstObject,
             InheritPriority = inheritPriority,
             PublisherPriority = publisherPriority,
         };

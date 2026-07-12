@@ -48,7 +48,7 @@ internal static class StreamIo
     public static async ValueTask<ulong> ReadVarIntAsync(IQuicStream stream, int firstByte,
         CancellationToken cancellationToken)
     {
-        int length = 1 << (firstByte >> 6);
+        int length = VarInt.GetEncodedLength((byte)firstByte);
         var bytes = new byte[length];
         bytes[0] = (byte)firstByte;
         if (length > 1 && !await ReadFullyAsync(stream, bytes.AsMemory(1), cancellationToken).ConfigureAwait(false))
