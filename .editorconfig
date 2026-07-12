@@ -24,6 +24,11 @@ dotnet_diagnostic.CA1711.severity = none
 # than a file per interface. Same house style as the Spangle server.
 dotnet_diagnostic.MA0048.severity = none
 
+# CA1062: nullable reference types are enabled, so a non-nullable parameter already declares
+# "not null" as its contract; the few places that genuinely accept external input validate
+# explicitly with ArgumentNullException.ThrowIfNull. Same choice as the Spangle server.
+dotnet_diagnostic.CA1062.severity = none
+
 [*.{csproj,props,targets}]
 indent_size = 2
 

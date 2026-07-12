@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Spangle.Net.Moqt</RootNamespace>
+    <!-- Media over QUIC Transport (MOQT), draft-ietf-moq-transport. Sits on the QUIC
+         seam: the wire codec and session run against IQuicTransport, so the protocol is
+         exercised over the in-memory backend where msquic/IPv6 is unavailable, and over
+         real msquic in CI. Media mapping (CMSF, MediaFrame) is deliberately NOT here — it
+         belongs in the Spangle core, which reuses this package and writes only the bridge. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Spangle.Net.Moqt.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Spangle.Net.Transport.Quic\Spangle.Net.Transport.Quic.csproj" />
+  </ItemGroup>
+
+</Project>

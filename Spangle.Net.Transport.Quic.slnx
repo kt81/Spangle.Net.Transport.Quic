@@ -1,8 +1,10 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Spangle.Net.Moqt/Spangle.Net.Moqt.csproj" />
     <Project Path="src/Spangle.Net.Transport.Quic/Spangle.Net.Transport.Quic.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Spangle.Net.Moqt.Tests/Spangle.Net.Moqt.Tests.csproj" />
     <Project Path="tests/Spangle.Net.Transport.Quic.Tests/Spangle.Net.Transport.Quic.Tests.csproj" />
   </Folder>
 </Solution>
