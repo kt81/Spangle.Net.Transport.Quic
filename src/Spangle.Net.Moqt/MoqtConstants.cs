@@ -51,10 +51,16 @@ public static class MoqControlMessageType
     /// <summary>TRACK_STATUS (§10.14) — first message on a request stream.</summary>
     public const ulong TrackStatus = 0xD;
 
-    /// <summary>PUBLISH_NAMESPACE (§10.15) — first message on a request stream.</summary>
+    /// <summary>PUBLISH_NAMESPACE (§10.15) — the publisher announces a Track Namespace.</summary>
     public const ulong PublishNamespace = 0x6;
 
-    /// <summary>NAMESPACE (§10.16).</summary>
+    /// <summary>
+    /// REQUEST_OK (0x7) — the generic success reply (draft-18 ≥ v15) that acknowledges a
+    /// request by its Request ID, e.g. a PUBLISH_NAMESPACE_OK.
+    /// </summary>
+    public const ulong RequestOk = 0x7;
+
+    /// <summary>NAMESPACE / PUBLISH_NAMESPACE_ERROR (§10.16, 0x8).</summary>
     public const ulong Namespace = 0x8;
 
     /// <summary>NAMESPACE_DONE (§10.17).</summary>

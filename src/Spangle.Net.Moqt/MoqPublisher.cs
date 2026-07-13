@@ -24,7 +24,9 @@ public sealed class MoqPublisher
 {
     private readonly MoqSession _session;
     private readonly Dictionary<string, MoqPublishedTrack> _tracks = new(StringComparer.Ordinal);
+    private readonly List<IQuicStream> _announcements = [];
     private ulong _nextAlias = 1;
+    private ulong _nextRequestId; // client-initiated request IDs (draft-18 §10.1)
 
     private MoqPublisher(MoqSession session) => _session = session;
 
@@ -33,6 +35,40 @@ public sealed class MoqPublisher
     {
         ArgumentNullException.ThrowIfNull(session);
         return new MoqPublisher(session);
+    }
+
+    /// <summary>
+    /// Announces a Track Namespace to an upstream peer (a relay) with PUBLISH_NAMESPACE and awaits
+    /// its REQUEST_OK. In draft-18 each request runs on its own bidirectional stream, so this opens
+    /// one, sends PUBLISH_NAMESPACE, and reads the reply on the same stream. The stream is kept
+    /// open for the life of the announcement. After this returns the relay may SUBSCRIBE to tracks
+    /// in the namespace; declare those with <see cref="PublishTrack"/> and answer subscriptions
+    /// with <see cref="RunAsync"/>.
+    /// </summary>
+    [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
+        Justification = "The request stream stays open while the namespace is announced; it is held in _announcements.")]
+    public async Task AnnounceNamespaceAsync(TrackNamespace @namespace, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(@namespace);
+        ulong requestId = _nextRequestId;
+        _nextRequestId += 2;
+
+        IQuicStream request = await _session.Connection
+            .OpenStreamAsync(QuicStreamDirection.Bidirectional, cancellationToken).ConfigureAwait(false);
+        _announcements.Add(request);
+
+        var payload = new ArrayBufferWriter<byte>();
+        new PublishNamespaceMessage(requestId, @namespace).EncodePayload(new MoqWriter(payload));
+        var frame = new ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.PublishNamespace, payload.WrittenSpan);
+        await request.WriteAsync(frame.WrittenMemory, completeWrites: false, cancellationToken).ConfigureAwait(false);
+
+        (ulong type, byte[] _) = await ControlMessage.ReadAsync(request, cancellationToken).ConfigureAwait(false);
+        if (type != MoqControlMessageType.RequestOk)
+        {
+            throw new MoqProtocolException(
+                $"Expected REQUEST_OK (0x{MoqControlMessageType.RequestOk:X}) after PUBLISH_NAMESPACE, got 0x{type:X}.");
+        }
     }
 
     /// <summary>
