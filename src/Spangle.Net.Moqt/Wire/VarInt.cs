@@ -1,32 +1,46 @@
+using System.Buffers.Binary;
+using System.Numerics;
+
 namespace Spangle.Net.Moqt.Wire;
 
 /// <summary>
-/// The QUIC variable-length integer (RFC 9000, Section 16), which MOQT uses for nearly
-/// every field. The two most-significant bits of the first byte select a 1-, 2-, 4-, or
-/// 8-byte big-endian encoding; the remaining 62 bits carry the value. This encoding is
-/// stable across every MoQ draft, so it is the one wire primitive that never needs revising.
+/// The MOQT variable-length integer (draft-ietf-moq-transport-18 §1.4.2), which is distinct
+/// from the QUIC RFC 9000 varint: the count of leading one-bits in the first byte selects the
+/// encoded length, UTF-8 style. <c>0xxxxxxx</c> is 1 byte (7-bit value), <c>10xxxxxx…</c> is 2
+/// bytes (14-bit), <c>110xxxxx…</c> is 3 bytes (21-bit), and so on to <c>11111110…</c> at 8
+/// bytes (56-bit) and <c>11111111</c> + 8 bytes at 9 bytes (a full 64-bit value). The value
+/// occupies the bits after the prefix, big-endian. The encoder emits the minimal form; the
+/// decoder also accepts non-minimal encodings (as the spec allows).
 /// </summary>
 public static class VarInt
 {
-    /// <summary>The largest value representable: 2^62 - 1.</summary>
-    public const ulong MaxValue = (1UL << 62) - 1;
+    /// <summary>The largest value representable: the full 64-bit range (a 9-byte encoding).</summary>
+    public const ulong MaxValue = ulong.MaxValue;
 
     /// <summary>
-    /// The encoded length (1, 2, 4, or 8) a var-int occupies, read from its first byte: the
-    /// two most-significant bits select the width. The one place this decode lives, so the
-    /// wire reader, the control-message framer, and the stream reader all agree.
+    /// The encoded length (1–9) a var-int occupies, read from its first byte: one more than the
+    /// number of leading one-bits (with <c>0xFF</c> selecting the 9-byte form). The one place
+    /// this decode lives, so the wire reader, the control-message framer, and the stream reader
+    /// all agree.
     /// </summary>
-    public static int GetEncodedLength(byte firstByte) => 1 << (firstByte >> 6);
+    public static int GetEncodedLength(byte firstByte)
+    {
+        int leadingOnes = BitOperations.LeadingZeroCount((uint)(byte)~firstByte) - 24;
+        return Math.Min(leadingOnes + 1, 9);
+    }
 
-    /// <summary>The number of bytes <paramref name="value"/> encodes to (1, 2, 4, or 8).</summary>
+    /// <summary>The number of bytes <paramref name="value"/> encodes to in its minimal form (1–9).</summary>
     public static int GetLength(ulong value) => value switch
     {
-        <= 0x3F => 1,
-        <= 0x3FFF => 2,
-        <= 0x3FFF_FFFF => 4,
-        <= MaxValue => 8,
-        _ => throw new ArgumentOutOfRangeException(nameof(value), value,
-            "Value exceeds the 62-bit range of a QUIC variable-length integer."),
+        <= 0x7FUL => 1,
+        <= 0x3FFFUL => 2,
+        <= 0x1F_FFFFUL => 3,
+        <= 0xFFF_FFFFUL => 4,
+        <= 0x7_FFFF_FFFFUL => 5,
+        <= 0x3FF_FFFF_FFFFUL => 6,
+        <= 0x1_FFFF_FFFF_FFFFUL => 7,
+        <= 0xFF_FFFF_FFFF_FFFFUL => 8,
+        _ => 9,
     };
 
     /// <summary>
@@ -48,10 +62,20 @@ public static class VarInt
             return false;
         }
 
-        ulong result = (ulong)(source[0] & 0x3F);
-        for (int i = 1; i < length; i++)
+        ulong result;
+        if (length == 9)
         {
-            result = (result << 8) | source[i];
+            // 0xFF prefix byte carries no value bits; the value is the next 8 bytes big-endian.
+            result = BinaryPrimitives.ReadUInt64BigEndian(source[1..9]);
+        }
+        else
+        {
+            // The first byte holds (8 - length) value bits below its length prefix.
+            result = (ulong)(source[0] & ((1 << (8 - length)) - 1));
+            for (int i = 1; i < length; i++)
+            {
+                result = (result << 8) | source[i];
+            }
         }
 
         value = result;
@@ -71,15 +95,23 @@ public static class VarInt
             throw new ArgumentException("Destination is too small for the encoded value.", nameof(destination));
         }
 
+        if (length == 9)
+        {
+            destination[0] = 0xFF;
+            BinaryPrimitives.WriteUInt64BigEndian(destination[1..9], value);
+            return 9;
+        }
+
+        // Lay the value big-endian across `length` bytes; its top `length` bits are zero (the
+        // value fits in 7*length bits), leaving room for the prefix.
         for (int i = length - 1; i >= 0; i--)
         {
             destination[i] = (byte)(value & 0xFF);
             value >>= 8;
         }
 
-        // 1->0b00, 2->0b01, 4->0b10, 8->0b11 in the two most-significant bits.
-        int prefix = System.Numerics.BitOperations.TrailingZeroCount(length);
-        destination[0] |= (byte)(prefix << 6);
+        // OR in the prefix: (length - 1) leading one-bits, i.e. 0xFF shifted left by (9 - length).
+        destination[0] |= (byte)(0xFF << (9 - length));
         return length;
     }
 }

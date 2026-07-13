@@ -102,7 +102,7 @@ public class MoqReaderWriterTests
     [Fact]
     public void ReadVarInt_TruncatedBuffer_Throws()
     {
-        byte[] buffer = [0x9d, 0x7f]; // announces 4 bytes, only 2 present
+        byte[] buffer = [0xC0, 0x40]; // announces a 3-byte varint, only 2 present
         try
         {
             var reader = new MoqReader(buffer);
