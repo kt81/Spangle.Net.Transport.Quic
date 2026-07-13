@@ -39,6 +39,12 @@ public sealed class MoqSession : IAsyncDisposable
     public bool IsServer { get; }
 
     /// <summary>
+    /// The underlying connection, on which the publisher/subscriber facades open and accept
+    /// request and subgroup streams. The session owns its lifetime; callers borrow it.
+    /// </summary>
+    internal IQuicConnection Connection => _connection;
+
+    /// <summary>
     /// Establishes a session as the client: open the outbound control stream and send SETUP,
     /// then read the peer's SETUP off its control stream.
     /// </summary>
