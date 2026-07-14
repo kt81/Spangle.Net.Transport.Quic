@@ -20,8 +20,15 @@ namespace Spangle.Net.Moqt;
 /// </summary>
 public sealed class MoqSubscriber
 {
+    // draft-18 §10.7: the SUBSCRIPTION_FILTER Subscribe Parameter (key 0x21, odd → a
+    // length-prefixed value) is mandatory; its value is a LocationType varint (2 = Largest
+    // Object = "from the latest object", the live-edge filter) plus, for absolute filters,
+    // a start location and end group. Live playback needs only the Largest Object form.
+    private const ulong SubscriptionFilterKey = 0x21;
+    private const ulong LargestObjectFilter = 2;
+
     private readonly MoqSession _session;
-    private ulong _nextRequestId = 1;
+    private ulong _nextRequestId; // client-initiated request IDs are even (draft-18 §10.1)
 
     private MoqSubscriber(MoqSession session) => _session = session;
 
@@ -47,8 +54,16 @@ public sealed class MoqSubscriber
         IQuicStream request = await _session.Connection
             .OpenStreamAsync(QuicStreamDirection.Bidirectional, cancellationToken).ConfigureAwait(false);
 
+        ulong requestId = _nextRequestId;
+        _nextRequestId += 2;
+
+        // Mandatory SUBSCRIPTION_FILTER, set to Largest Object (subscribe from the live edge).
+        var filterValue = new ArrayBufferWriter<byte>();
+        new MoqWriter(filterValue).WriteVarInt(LargestObjectFilter);
+        var filter = MoqKeyValuePair.FromBytes(SubscriptionFilterKey, filterValue.WrittenSpan);
+
         var payload = new ArrayBufferWriter<byte>();
-        new SubscribeMessage(_nextRequestId++, track).EncodePayload(new MoqWriter(payload));
+        new SubscribeMessage(requestId, track, [filter]).EncodePayload(new MoqWriter(payload));
         var frame = new ArrayBufferWriter<byte>();
         ControlMessage.Write(frame, MoqControlMessageType.Subscribe, payload.WrittenSpan);
         await request.WriteAsync(frame.WrittenMemory, completeWrites: false, cancellationToken)
