@@ -33,6 +33,9 @@ public sealed class SubgroupStreamReader
         return new SubgroupStreamReader(stream, header);
     }
 
+    /// <summary>Wraps a stream whose SUBGROUP_HEADER a caller has already read.</summary>
+    internal static SubgroupStreamReader Create(IQuicStream stream, SubgroupHeader header) => new(stream, header);
+
     /// <summary>Reads the next object, or null once the stream has FIN'd at an object boundary.</summary>
     public async ValueTask<MoqObject?> ReadObjectAsync(CancellationToken cancellationToken = default)
     {

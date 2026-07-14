@@ -13,7 +13,8 @@ public sealed class MoqObject
     /// <summary>Creates an object with the given coordinates, status, payload, and extensions.</summary>
     public MoqObject(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
         MoqObjectStatus status, ReadOnlyMemory<byte> payload,
-        IReadOnlyList<MoqKeyValuePair>? extensions = null)
+        IReadOnlyList<MoqKeyValuePair>? extensions = null,
+        MoqForwardingPreference forwarding = MoqForwardingPreference.Subgroup)
     {
         if (status != MoqObjectStatus.Normal && !payload.IsEmpty)
         {
@@ -27,6 +28,7 @@ public sealed class MoqObject
         Status = status;
         Payload = payload;
         Extensions = extensions ?? [];
+        Forwarding = forwarding;
     }
 
     /// <summary>The id of the Object's Group within the track.</summary>
@@ -55,10 +57,30 @@ public sealed class MoqObject
     /// </summary>
     public IReadOnlyList<MoqKeyValuePair> Extensions { get; }
 
+    /// <summary>
+    /// How the publisher sends this object (draft-18 §11.2.1). It is a property of the individual
+    /// object, not of the track, and a <see cref="MoqForwardingPreference.Datagram"/> object has no
+    /// Subgroup ID — so <see cref="SubgroupId"/> is meaningless for one.
+    /// </summary>
+    public MoqForwardingPreference Forwarding { get; }
+
     /// <summary>A normal object carrying a payload and optional extension headers.</summary>
     public static MoqObject Normal(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
         ReadOnlyMemory<byte> payload, IReadOnlyList<MoqKeyValuePair>? extensions = null) =>
         new(groupId, objectId, subgroupId, publisherPriority, MoqObjectStatus.Normal, payload, extensions);
+}
+
+/// <summary>
+/// How a publisher sends an Object (draft-18 §11.2.1). This is per-object and can vary within a
+/// track; in a subscription an Object MUST be sent according to its preference.
+/// </summary>
+public enum MoqForwardingPreference
+{
+    /// <summary>Sent on a subgroup stream. Every object on a SUBGROUP_HEADER stream is this.</summary>
+    Subgroup,
+
+    /// <summary>Sent in a datagram, so the object has no Subgroup ID.</summary>
+    Datagram,
 }
 
 /// <summary>

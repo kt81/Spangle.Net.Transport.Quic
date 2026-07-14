@@ -83,6 +83,16 @@ public readonly struct SubgroupHeader
         ArgumentNullException.ThrowIfNull(stream);
 
         ulong rawType = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
+        return await ReadAfterTypeAsync(stream, rawType, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads the header's body, for a caller that has already consumed the stream type varint —
+    /// which a router must, since that varint is what tells a subgroup stream from a fetch one.
+    /// </summary>
+    internal static async ValueTask<SubgroupHeader> ReadAfterTypeAsync(IQuicStream stream, ulong rawType,
+        CancellationToken cancellationToken)
+    {
         SubgroupHeaderType type = SubgroupHeaderType.Parse(rawType);
         SubgroupIdMode mode = type.SubgroupIdMode;
 
