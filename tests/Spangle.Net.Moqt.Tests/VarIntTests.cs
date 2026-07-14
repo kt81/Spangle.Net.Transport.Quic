@@ -3,7 +3,7 @@ using Spangle.Net.Moqt.Wire;
 namespace Spangle.Net.Moqt.Tests;
 
 /// <summary>
-/// The MOQT variable-length integer codec (draft-18 §1.4.2): the UTF-8-style leading-one-bit
+/// The MOQT variable-length integer codec (draft-18 §1.4.1): the UTF-8-style leading-one-bit
 /// length prefix, distinct from the QUIC RFC 9000 varint. Pinned to worked encodings (including
 /// the SETUP frame type 0x2F00 -> AF 00 that the reference relay emits), the length-class
 /// boundaries, and the non-minimal-decode rule.
@@ -30,6 +30,32 @@ public class VarIntTests
         int written = VarInt.Write(buffer, value);
         written.Should().Be(expected.Length);
         buffer.AsSpan(0, written).ToArray().Should().Equal(expected);
+    }
+
+    /// <summary>
+    /// The worked examples the spec itself tabulates. Every other test here was written against our
+    /// own reading of the encoding rules, so a misreading would sit in the encoder and the decoder
+    /// alike and round-trip green — which is exactly how this codec passed its tests for weeks while
+    /// emitting QUIC varints. These vectors come from outside that loop, and they pin the 5-, 6- and
+    /// 7-byte classes, which no other byte-level assertion here reaches.
+    /// </summary>
+    [Theory]
+    [InlineData(37UL, new byte[] { 0x25 })]
+    [InlineData(15_293UL, new byte[] { 0xBB, 0xBD })]
+    [InlineData(226_442_877UL, new byte[] { 0xED, 0x7F, 0x3E, 0x7D })]
+    [InlineData(2_893_212_287_960UL, new byte[] { 0xFA, 0xA1, 0xA0, 0xE4, 0x03, 0xD8 })]
+    [InlineData(151_288_809_941_952UL, new byte[] { 0xFC, 0x89, 0x98, 0xAB, 0xC6, 0x6B, 0xC0 })]
+    [InlineData(70_423_237_261_249_041UL, new byte[] { 0xFE, 0xFA, 0x31, 0x8F, 0xA8, 0xE3, 0xCA, 0x11 })]
+    [InlineData(ulong.MaxValue, new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF })]
+    public void SpecWorkedExamples_EncodeAndDecodeBothWays(ulong value, byte[] encoded)
+    {
+        var buffer = new byte[9];
+        int written = VarInt.Write(buffer, value);
+        buffer.AsSpan(0, written).ToArray().Should().Equal(encoded, "the spec tabulates this encoding");
+
+        VarInt.TryRead(encoded, out ulong decoded, out int read).Should().BeTrue();
+        decoded.Should().Be(value);
+        read.Should().Be(encoded.Length);
     }
 
     [Theory]

@@ -4,7 +4,7 @@ using System.Numerics;
 namespace Spangle.Net.Moqt.Wire;
 
 /// <summary>
-/// The MOQT variable-length integer (draft-ietf-moq-transport-18 §1.4.2), which is distinct
+/// The MOQT variable-length integer (draft-ietf-moq-transport-18 §1.4.1), which is distinct
 /// from the QUIC RFC 9000 varint: the count of leading one-bits in the first byte selects the
 /// encoded length, UTF-8 style. <c>0xxxxxxx</c> is 1 byte (7-bit value), <c>10xxxxxx…</c> is 2
 /// bytes (14-bit), <c>110xxxxx…</c> is 3 bytes (21-bit), and so on to <c>11111110…</c> at 8
