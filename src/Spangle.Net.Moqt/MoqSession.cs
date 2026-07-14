@@ -115,6 +115,21 @@ public sealed class MoqSession : IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
+        // Close the connection first (error code 0 = no error). This aborts every stream, so the
+        // stream and connection DisposeAsync calls below return at once instead of waiting on a
+        // graceful FIN drain / idle timeout for streams the higher layers left open — which is
+        // tens of seconds against a live peer.
+#pragma warning disable CA1031 // best-effort during disposal: the peer may have already aborted
+        try
+        {
+            await _connection.CloseAsync(0).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // fall through to DisposeAsync regardless
+        }
+#pragma warning restore CA1031
+
         await _outboundControl.DisposeAsync().ConfigureAwait(false);
         await _inboundControl.DisposeAsync().ConfigureAwait(false);
         await _connection.DisposeAsync().ConfigureAwait(false);
