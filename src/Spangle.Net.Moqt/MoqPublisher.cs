@@ -176,12 +176,14 @@ public sealed class MoqPublishedTrack
     /// <summary>
     /// Opens a subgroup stream for a new group and returns a writer for its objects, awaiting the
     /// first subscriber if none has arrived yet. Each group is one subgroup stream (subgroup 0);
-    /// dispose or complete the returned writer before beginning the next group.
+    /// dispose or complete the returned writer before beginning the next group. Set
+    /// <paramref name="hasExtensions"/> when the objects carry Extension Headers — it selects the
+    /// header's Properties bit, which every object on the stream must then honour.
     /// </summary>
     [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
         Justification = "The opened stream is owned by the returned MoqGroupWriter and disposed there.")]
     public async ValueTask<MoqGroupWriter> BeginGroupAsync(ulong groupId, byte publisherPriority,
-        CancellationToken cancellationToken = default)
+        bool hasExtensions = false, CancellationToken cancellationToken = default)
     {
         // _subscribed is this track's own TCS, completed by AttachSubscriber on the demux loop;
         // awaiting it is not the foreign-task deadlock hazard VSTHRD003 guards against.
@@ -196,6 +198,7 @@ public sealed class MoqPublishedTrack
             GroupId = groupId,
             SubgroupIdMode = SubgroupIdMode.Explicit,
             SubgroupId = 0,
+            HasProperties = hasExtensions,
             PublisherPriority = publisherPriority,
         };
         return new MoqGroupWriter(stream, header);
@@ -222,11 +225,16 @@ public sealed class MoqGroupWriter : IAsyncDisposable
     /// <summary>The group these objects belong to.</summary>
     public ulong GroupId => _header.GroupId;
 
-    /// <summary>Appends one object (with the group's priority and subgroup 0) to the stream.</summary>
+    /// <summary>
+    /// Appends one object (with the group's priority and subgroup 0) to the stream, optionally
+    /// carrying Extension Headers — which requires the group to have been opened with
+    /// <c>hasExtensions</c>.
+    /// </summary>
     public ValueTask WriteObjectAsync(ulong objectId, ReadOnlyMemory<byte> payload,
-        CancellationToken cancellationToken = default) =>
+        IReadOnlyList<MoqKeyValuePair>? extensions = null, CancellationToken cancellationToken = default) =>
         _writer.WriteObjectAsync(
-            MoqObject.Normal(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority, payload),
+            MoqObject.Normal(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority, payload,
+                extensions),
             cancellationToken);
 
     /// <summary>FINs the subgroup stream, signalling the group is complete.</summary>

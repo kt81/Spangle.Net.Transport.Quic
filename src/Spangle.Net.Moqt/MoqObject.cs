@@ -1,16 +1,19 @@
+using Spangle.Net.Moqt.Wire;
+
 namespace Spangle.Net.Moqt;
 
 /// <summary>
 /// A MOQT Object (draft-18 §2.1, §11.2.1): the atomic unit of media on a track. It is
 /// addressed by Group and Object id within a Subgroup, carries the publisher's priority and
-/// a status, and an opaque payload the media layer fills. This is the type the Spangle
-/// bridge produces (egress) and consumes (ingest) at the package boundary.
+/// a status, an opaque payload the media layer fills, and optional Extension Headers. This is
+/// the type the Spangle bridge produces (egress) and consumes (ingest) at the package boundary.
 /// </summary>
 public sealed class MoqObject
 {
-    /// <summary>Creates an object with the given coordinates, status, and payload.</summary>
+    /// <summary>Creates an object with the given coordinates, status, payload, and extensions.</summary>
     public MoqObject(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
-        MoqObjectStatus status, ReadOnlyMemory<byte> payload)
+        MoqObjectStatus status, ReadOnlyMemory<byte> payload,
+        IReadOnlyList<MoqKeyValuePair>? extensions = null)
     {
         if (status != MoqObjectStatus.Normal && !payload.IsEmpty)
         {
@@ -23,6 +26,7 @@ public sealed class MoqObject
         PublisherPriority = publisherPriority;
         Status = status;
         Payload = payload;
+        Extensions = extensions ?? [];
     }
 
     /// <summary>The id of the Object's Group within the track.</summary>
@@ -43,10 +47,18 @@ public sealed class MoqObject
     /// <summary>The opaque payload; empty for any non-normal status.</summary>
     public ReadOnlyMemory<byte> Payload { get; }
 
-    /// <summary>A normal object carrying a payload.</summary>
+    /// <summary>
+    /// The object's Extension Headers as Key-Value-Pairs — where a media mapping carries its
+    /// per-frame metadata (draft-cenzano-moq-media-interop puts the media type, timestamps and
+    /// codec extradata here). Only written when the subgroup header's Properties bit is set;
+    /// empty otherwise.
+    /// </summary>
+    public IReadOnlyList<MoqKeyValuePair> Extensions { get; }
+
+    /// <summary>A normal object carrying a payload and optional extension headers.</summary>
     public static MoqObject Normal(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
-        ReadOnlyMemory<byte> payload) =>
-        new(groupId, objectId, subgroupId, publisherPriority, MoqObjectStatus.Normal, payload);
+        ReadOnlyMemory<byte> payload, IReadOnlyList<MoqKeyValuePair>? extensions = null) =>
+        new(groupId, objectId, subgroupId, publisherPriority, MoqObjectStatus.Normal, payload, extensions);
 }
 
 /// <summary>

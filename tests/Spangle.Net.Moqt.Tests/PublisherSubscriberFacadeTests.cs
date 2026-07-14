@@ -97,16 +97,18 @@ public class PublisherSubscriberFacadeTests
             CollectAsync(subscriber, track, expected: 3, ct);
 
         // Two groups: group 0 with objects {0,1}, group 1 with object {0}.
-        await using (MoqGroupWriter g0 = await published.BeginGroupAsync(0, publisherPriority: 100, ct))
+        await using (MoqGroupWriter g0 = await published.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct))
         {
-            await g0.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g0o0"), ct);
-            await g0.WriteObjectAsync(1, Encoding.UTF8.GetBytes("g0o1"), ct);
+            await g0.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g0o0"), cancellationToken: ct);
+            await g0.WriteObjectAsync(1, Encoding.UTF8.GetBytes("g0o1"), cancellationToken: ct);
             await g0.CompleteAsync(ct);
         }
 
-        await using (MoqGroupWriter g1 = await published.BeginGroupAsync(1, publisherPriority: 100, ct))
+        await using (MoqGroupWriter g1 = await published.BeginGroupAsync(1, publisherPriority: 100,
+            cancellationToken: ct))
         {
-            await g1.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g1o0"), ct);
+            await g1.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g1o0"), cancellationToken: ct);
             await g1.CompleteAsync(ct);
         }
 

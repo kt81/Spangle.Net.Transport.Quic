@@ -57,7 +57,12 @@ public sealed class SubgroupStreamWriter
         writer.WriteVarInt(delta);
         if (_header.HasProperties)
         {
-            writer.WriteVarInt(0); // Properties Length 0 — this writer emits no object properties
+            // Object Extension Headers: a byte-length-prefixed block of Key-Value-Pairs. Their
+            // types are delta-encoded, so the block must be in non-decreasing type order.
+            var extensions = new ArrayBufferWriter<byte>();
+            KeyValuePairCodec.WriteList(new MoqWriter(extensions), [.. moqObject.Extensions.OrderBy(p => p.Type)]);
+            writer.WriteVarInt((ulong)extensions.WrittenCount);
+            buffer.Write(extensions.WrittenSpan);
         }
 
         writer.WriteVarInt((ulong)moqObject.Payload.Length);

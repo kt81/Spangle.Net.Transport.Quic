@@ -46,13 +46,17 @@ public sealed class SubgroupStreamReader
         ulong objectId = _first ? delta : _previousObjectId + delta + 1;
         _previousObjectId = objectId;
 
+        IReadOnlyList<MoqKeyValuePair> extensions = [];
         if (Header.HasProperties)
         {
+            // Object Extension Headers: a byte-length-prefixed block of Key-Value-Pairs.
             ulong propertiesLength = await StreamIo.ReadVarIntAsync(_stream, cancellationToken).ConfigureAwait(false);
             if (propertiesLength > 0)
             {
-                _ = await StreamIo.ReadExactAsync(_stream, ToLength(propertiesLength), cancellationToken)
-                    .ConfigureAwait(false); // properties are not interpreted yet
+                byte[] block = await StreamIo.ReadExactAsync(_stream, ToLength(propertiesLength), cancellationToken)
+                    .ConfigureAwait(false);
+                var reader = new MoqReader(block);
+                extensions = KeyValuePairCodec.ReadList(ref reader);
             }
         }
 
@@ -89,7 +93,8 @@ public sealed class SubgroupStreamReader
             _first = false;
         }
 
-        return new MoqObject(Header.GroupId, objectId, _resolvedSubgroupId, Header.PublisherPriority, status, payload);
+        return new MoqObject(Header.GroupId, objectId, _resolvedSubgroupId, Header.PublisherPriority, status, payload,
+            extensions);
     }
 
     private static int ToLength(ulong value)
