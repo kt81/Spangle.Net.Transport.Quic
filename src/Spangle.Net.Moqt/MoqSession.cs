@@ -45,6 +45,16 @@ public sealed class MoqSession : IAsyncDisposable
     internal IQuicConnection Connection => _connection;
 
     /// <summary>
+    /// Opens a new bidirectional request stream. In draft-18 every request/reply pair runs on its
+    /// own stream (§10 Table: SUBSCRIBE, PUBLISH, FETCH, TRACK_STATUS, PUBLISH_NAMESPACE,
+    /// SUBSCRIBE_NAMESPACE and SUBSCRIBE_TRACKS are each "Request, First"), so the Request ID in
+    /// the reply is implicit and the stream's lifetime is the request's. The caller writes the
+    /// opening control message and reads the reply on the returned stream.
+    /// </summary>
+    public ValueTask<IQuicStream> OpenRequestStreamAsync(CancellationToken cancellationToken = default) =>
+        _connection.OpenStreamAsync(QuicStreamDirection.Bidirectional, cancellationToken);
+
+    /// <summary>
     /// Establishes a session as the client: open the outbound control stream and send SETUP,
     /// then read the peer's SETUP off its control stream.
     /// </summary>

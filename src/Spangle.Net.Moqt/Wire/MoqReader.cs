@@ -57,6 +57,20 @@ public ref struct MoqReader
         return (int)value;
     }
 
+    /// <summary>
+    /// Reads one raw byte, for the spec's fixed 8-bit fields (e.g. FETCH_OK's End Of Track) —
+    /// which are not varints.
+    /// </summary>
+    public byte ReadByte()
+    {
+        if (_position >= _buffer.Length)
+        {
+            throw new MoqProtocolException("Truncated buffer where a byte was expected.");
+        }
+
+        return _buffer[_position++];
+    }
+
     /// <summary>Reads a varint length followed by that many bytes, returned as a borrowed slice.</summary>
     public ReadOnlySpan<byte> ReadBytes()
     {

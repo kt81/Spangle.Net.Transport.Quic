@@ -28,6 +28,17 @@ public sealed class MoqWriter
         _output.Advance(length);
     }
 
+    /// <summary>
+    /// Writes one raw byte, for the spec's fixed 8-bit fields (e.g. FETCH_OK's End Of Track) —
+    /// which are not varints.
+    /// </summary>
+    public void WriteByte(byte value)
+    {
+        Span<byte> span = _output.GetSpan(1);
+        span[0] = value;
+        _output.Advance(1);
+    }
+
     /// <summary>Writes a varint length followed by the bytes themselves.</summary>
     public void WriteBytes(ReadOnlySpan<byte> bytes)
     {

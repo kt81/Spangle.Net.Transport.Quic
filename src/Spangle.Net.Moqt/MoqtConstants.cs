@@ -24,8 +24,14 @@ public static class MoqControlMessageType
     /// <summary>SETUP (§10.3) — first message on each control stream.</summary>
     public const ulong Setup = 0x2F00;
 
-    /// <summary>GOAWAY (§10.4).</summary>
+    /// <summary>GOAWAY (§10.4) — the only message besides SETUP allowed on the control stream.</summary>
     public const ulong GoAway = 0x10;
+
+    /// <summary>REQUEST_UPDATE (§10.9) — updates an in-flight request.</summary>
+    public const ulong RequestUpdate = 0x2;
+
+    /// <summary>REQUEST_ERROR (§10.6) — the generic failure reply.</summary>
+    public const ulong RequestError = 0x5;
 
     /// <summary>SUBSCRIBE (§10.7) — first message on a request stream.</summary>
     public const ulong Subscribe = 0x3;
