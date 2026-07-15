@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Spangle.Net.Moqt.Data;
 using Spangle.Net.Moqt.Messages;
 using Spangle.Net.Transport.Quic;
 using Spangle.Net.Transport.Quic.InMemory;
@@ -58,6 +59,76 @@ public class PublisherSubscriberFacadeTests
 
         (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, cts.Token);
         await RunFlowAndAssertAsync(serverConn, clientConn, cts.Token);
+    }
+
+    /// <summary>
+    /// A group opened with <c>endOfGroup</c> reaches the subscriber saying so. The bit is the only
+    /// thing that tells a receiver a group ended deliberately rather than being still in flight, so
+    /// a facade that quietly dropped it would cost every subscriber a timeout per group — a fault
+    /// that never shows up as a missing object.
+    /// </summary>
+    [Fact]
+    public async Task AGroupOpenedAsEndOfGroup_SaysSoOnTheWire()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+        FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack published = publisher.PublishTrack(track);
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+
+        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
+        await using MoqSubscription subscription = await subscriber.SubscribeAsync(track, ct);
+        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, subscription.TrackAlias, ct);
+
+        await using (MoqGroupWriter group = await published.BeginGroupAsync(7, publisherPriority: 100,
+            endOfGroup: true, subgroupId: 3, cancellationToken: ct))
+        {
+            await group.WriteObjectAsync(0, Encoding.UTF8.GetBytes("only"), cancellationToken: ct);
+            await group.CompleteAsync(ct);
+        }
+
+        SubgroupHeader header = await headerTask;
+        header.EndOfGroup.Should().BeTrue();
+        header.SubgroupId.Should().Be(3UL, "a publisher spreading a group over subgroups names each one");
+        header.GroupId.Should().Be(7UL);
+
+        await runCts.CancelAsync();
+        try
+        {
+            await run;
+        }
+        catch (OperationCanceledException)
+        {
+            // the demux loop is cancelled once the flow is verified
+        }
+    }
+
+    private static async Task<SubgroupHeader> FirstSubgroupHeaderAsync(IQuicConnection connection, ulong alias,
+        CancellationToken ct)
+    {
+        while (true)
+        {
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(connection, ct);
+            if (incoming is MoqSubgroupStream subgroup && subgroup.Reader.Header.TrackAlias == alias)
+            {
+                return subgroup.Reader.Header;
+            }
+        }
     }
 
     private static async Task<(IQuicConnection Server, IQuicConnection Client)> ConnectPairAsync(

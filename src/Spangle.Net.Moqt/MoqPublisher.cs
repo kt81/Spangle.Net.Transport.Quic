@@ -174,16 +174,29 @@ public sealed class MoqPublishedTrack
     internal void AttachSubscriber(ulong alias) => _subscribed.TrySetResult(alias);
 
     /// <summary>
-    /// Opens a subgroup stream for a new group and returns a writer for its objects, awaiting the
-    /// first subscriber if none has arrived yet. Each group is one subgroup stream (subgroup 0);
-    /// dispose or complete the returned writer before beginning the next group. Set
-    /// <paramref name="hasExtensions"/> when the objects carry Extension Headers — it selects the
-    /// header's Properties bit, which every object on the stream must then honour.
+    /// Opens a subgroup stream and returns a writer for its objects, awaiting the first subscriber
+    /// if none has arrived yet. Dispose or complete the returned writer when the subgroup is done.
+    /// Set <paramref name="hasExtensions"/> when the objects carry Extension Headers — it selects
+    /// the header's Properties bit, which every object on the stream must then honour.
+    /// <para>
+    /// <paramref name="endOfGroup"/> sets the header's END_OF_GROUP bit, asserting that this
+    /// subgroup holds the group's largest Object — so on FIN the group is complete. It is worth
+    /// setting: it is the only thing that tells a subscriber a group ended on purpose. Without it a
+    /// receiver cannot tell a finished group from one whose rest is still in flight, and waits out
+    /// a timeout before moving on. A publisher that puts a whole group on one subgroup stream knows
+    /// this at the point it opens the stream and should always set it; one that spreads a group
+    /// across subgroups only knows it for the subgroup it finishes last.
+    /// </para>
+    /// <para>
+    /// <paramref name="subgroupId"/> distinguishes concurrent subgroups within one group. Leave it
+    /// at 0 for one-subgroup-per-group; a publisher that opens several must give each its own.
+    /// </para>
     /// </summary>
     [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
         Justification = "The opened stream is owned by the returned MoqGroupWriter and disposed there.")]
     public async ValueTask<MoqGroupWriter> BeginGroupAsync(ulong groupId, byte publisherPriority,
-        bool hasExtensions = false, CancellationToken cancellationToken = default)
+        bool hasExtensions = false, bool endOfGroup = false, ulong subgroupId = 0,
+        CancellationToken cancellationToken = default)
     {
         // _subscribed is this track's own TCS, completed by AttachSubscriber on the demux loop;
         // awaiting it is not the foreign-task deadlock hazard VSTHRD003 guards against.
@@ -197,8 +210,9 @@ public sealed class MoqPublishedTrack
             TrackAlias = alias,
             GroupId = groupId,
             SubgroupIdMode = SubgroupIdMode.Explicit,
-            SubgroupId = 0,
+            SubgroupId = subgroupId,
             HasProperties = hasExtensions,
+            EndOfGroup = endOfGroup,
             PublisherPriority = publisherPriority,
         };
         return new MoqGroupWriter(stream, header);
@@ -225,6 +239,9 @@ public sealed class MoqGroupWriter : IAsyncDisposable
     /// <summary>The group these objects belong to.</summary>
     public ulong GroupId => _header.GroupId;
 
+    /// <summary>The subgroup within that group these objects are on.</summary>
+    public ulong SubgroupId => _header.SubgroupId;
+
     /// <summary>
     /// Appends one object (with the group's priority and subgroup 0) to the stream, optionally
     /// carrying Extension Headers — which requires the group to have been opened with
@@ -237,7 +254,20 @@ public sealed class MoqGroupWriter : IAsyncDisposable
                 extensions),
             cancellationToken);
 
-    /// <summary>FINs the subgroup stream, signalling the group is complete.</summary>
+    /// <summary>
+    /// Appends a zero-length object with the End of Group status (§11.2.1.1): no object at or after
+    /// <paramref name="objectId"/> exists in the group. This says on the wire what the header's
+    /// END_OF_GROUP bit says in the header — which is what a publisher needs when it could not have
+    /// known the group was ending at the time it opened the stream, because the bit is written with
+    /// the header and the news arrives later.
+    /// </summary>
+    public ValueTask WriteEndOfGroupAsync(ulong objectId, CancellationToken cancellationToken = default) =>
+        _writer.WriteObjectAsync(
+            new MoqObject(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority,
+                MoqObjectStatus.EndOfGroup, ReadOnlyMemory<byte>.Empty),
+            cancellationToken);
+
+    /// <summary>FINs the subgroup stream, signalling the subgroup is complete.</summary>
     public ValueTask CompleteAsync(CancellationToken cancellationToken = default) =>
         _writer.CompleteAsync(cancellationToken);
 
