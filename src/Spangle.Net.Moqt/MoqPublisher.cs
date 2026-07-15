@@ -27,6 +27,7 @@ public sealed class MoqPublisher
     private readonly List<IQuicStream> _announcements = [];
     private ulong _nextAlias = 1;
     private ulong _nextRequestId; // client-initiated request IDs (draft-18 §10.1)
+    private Exception? _stopped;
 
     private MoqPublisher(MoqSession session) => _session = session;
 
@@ -80,6 +81,11 @@ public sealed class MoqPublisher
     {
         ArgumentNullException.ThrowIfNull(name);
         var track = new MoqPublishedTrack(_session.Connection, name);
+        if (_stopped is { } stopped)
+        {
+            track.FailSubscribers(stopped);
+        }
+
         _tracks[Key(name)] = track;
         return track;
     }
@@ -89,37 +95,67 @@ public sealed class MoqPublisher
     /// declared track is answered with SUBSCRIBE_OK carrying a newly assigned Track Alias, after
     /// which the track streams its objects to that subscriber. A SUBSCRIBE for an unknown track
     /// is rejected by resetting the request stream (no SUBSCRIBE_ERROR yet).
+    /// <para>
+    /// When this loop stops — cancelled, or because the session died under it — every track's wait
+    /// for a subscriber stops with it. Nothing else would notice: a publisher whose connection has
+    /// gone silently sits in <see cref="MoqPublishedTrack.BeginGroupAsync"/> forever, waiting for a
+    /// subscriber that no longer has any way to arrive, and this task's exception is only seen by a
+    /// caller who awaits it.
+    /// </para>
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            MoqIncomingStream incoming;
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                incoming = await MoqStreamRouter.AcceptAsync(_session.Connection, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
+                MoqIncomingStream incoming;
+                try
+                {
+                    incoming = await MoqStreamRouter.AcceptAsync(_session.Connection, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
 
-            if (incoming is not MoqRequestStream request || request.MessageType != MoqControlMessageType.Subscribe)
-            {
-                continue; // this cut only handles SUBSCRIBE request streams
-            }
+                if (incoming is not MoqRequestStream request || request.MessageType != MoqControlMessageType.Subscribe)
+                {
+                    continue; // this cut only handles SUBSCRIBE request streams
+                }
 
-            SubscribeMessage subscribe = SubscribeMessage.DecodePayload(request.Payload.Span);
-            if (!_tracks.TryGetValue(Key(subscribe.Track), out MoqPublishedTrack? track))
-            {
-                request.Stream.Abort(0); // unknown track; no SUBSCRIBE_ERROR in this cut
-                continue;
-            }
+                SubscribeMessage subscribe = SubscribeMessage.DecodePayload(request.Payload.Span);
+                if (!_tracks.TryGetValue(Key(subscribe.Track), out MoqPublishedTrack? track))
+                {
+                    request.Stream.Abort(0); // unknown track; no SUBSCRIBE_ERROR in this cut
+                    continue;
+                }
 
-            ulong alias = _nextAlias++;
-            await WriteSubscribeOkAsync(request.Stream, alias, cancellationToken).ConfigureAwait(false);
-            track.AttachSubscriber(alias);
+                ulong alias = _nextAlias++;
+                await WriteSubscribeOkAsync(request.Stream, alias, cancellationToken).ConfigureAwait(false);
+                track.AttachSubscriber(alias);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Whatever ended the loop — a dead connection, a malformed request — is what every
+            // waiting track should be told, rather than being left to wait on it.
+            Stop(ex);
+            throw;
+        }
+
+        Stop(new MoqProtocolException("The publisher stopped serving subscriptions."));
+    }
+
+    // The publisher answers no more subscriptions, so nothing is coming for the tracks that are
+    // waiting on one, and nothing is coming for tracks declared after this either.
+    private void Stop(Exception reason)
+    {
+        _stopped ??= reason;
+        foreach (MoqPublishedTrack track in _tracks.Values)
+        {
+            track.FailSubscribers(reason);
         }
     }
 
@@ -151,6 +187,7 @@ public sealed class MoqPublishedTrack
     private readonly IQuicConnection _connection;
     private readonly TaskCompletionSource<ulong> _subscribed =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private ulong _alias;
 
     internal MoqPublishedTrack(IQuicConnection connection, FullTrackName name)
     {
@@ -162,6 +199,21 @@ public sealed class MoqPublishedTrack
     public FullTrackName Name { get; }
 
     /// <summary>
+    /// Whether a subscriber has arrived, without waiting for one. A live publisher asks this: with
+    /// nobody subscribed there is nothing to do with a frame but drop it, and blocking on
+    /// <see cref="BeginGroupAsync"/> instead would stall the pipeline feeding it.
+    /// </summary>
+    public bool HasSubscriber => _subscribed.Task.IsCompletedSuccessfully;
+
+    /// <summary>
+    /// The Track Alias the objects of the next group will carry — the one the newest subscription
+    /// assigned. A relay re-subscribes with a fresh alias every time its own subscriber count goes
+    /// from none to one, and objects sent under the previous alias are objects it has nowhere to
+    /// put: it answers "unknown track alias" and the viewer sees nothing at all.
+    /// </summary>
+    public ulong CurrentAlias => Volatile.Read(ref _alias);
+
+    /// <summary>
     /// Completes with the assigned Track Alias once a subscriber has subscribed to this track.
     /// The bridge can await this to avoid producing groups no one will receive.
     /// </summary>
@@ -171,7 +223,19 @@ public sealed class MoqPublishedTrack
     public Task<ulong> WaitForSubscriberAsync() => _subscribed.Task;
 #pragma warning restore VSTHRD003
 
-    internal void AttachSubscriber(ulong alias) => _subscribed.TrySetResult(alias);
+    /// <summary>
+    /// Binds the track to the subscription that just arrived. Later subscriptions replace the alias
+    /// rather than being ignored: the first one completes the wait, but it is the newest that says
+    /// where objects go.
+    /// </summary>
+    internal void AttachSubscriber(ulong alias)
+    {
+        Volatile.Write(ref _alias, alias);
+        _subscribed.TrySetResult(alias);
+    }
+
+    /// <summary>Ends the wait for a subscriber: none can arrive now, so waiting is not an option.</summary>
+    internal void FailSubscribers(Exception reason) => _subscribed.TrySetException(reason);
 
     /// <summary>
     /// Opens a subgroup stream and returns a writer for its objects, awaiting the first subscriber
@@ -201,8 +265,11 @@ public sealed class MoqPublishedTrack
         // _subscribed is this track's own TCS, completed by AttachSubscriber on the demux loop;
         // awaiting it is not the foreign-task deadlock hazard VSTHRD003 guards against.
 #pragma warning disable VSTHRD003
-        ulong alias = await _subscribed.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _subscribed.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 #pragma warning restore VSTHRD003
+        // Read the alias per group rather than taking the one the wait returned: a track outlives
+        // its subscriptions, and each new one renames it.
+        ulong alias = CurrentAlias;
         IQuicStream stream = await _connection
             .OpenStreamAsync(QuicStreamDirection.Unidirectional, cancellationToken).ConfigureAwait(false);
         var header = new SubgroupHeader

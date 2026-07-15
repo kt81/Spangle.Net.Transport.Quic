@@ -118,6 +118,117 @@ public class PublisherSubscriberFacadeTests
         }
     }
 
+    /// <summary>
+    /// A second subscription renames the track, and objects follow the new name. A relay
+    /// re-subscribes with a fresh Track Alias each time its own subscriber count rises from none —
+    /// so a publisher that kept using the first alias would answer every viewer after the first with
+    /// objects the relay has nowhere to put ("unknown track alias"), and they would see nothing.
+    /// </summary>
+    [Fact]
+    public async Task ASecondSubscription_MovesTheTrackToItsNewAlias()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+        FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack published = publisher.PublishTrack(track);
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+
+        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
+        await using MoqSubscription first = await subscriber.SubscribeAsync(track, ct);
+        ulong firstAlias = await published.WaitForSubscriberAsync().WaitAsync(ct);
+
+        // The same peer subscribes again, as a relay does when a new viewer arrives.
+        await using MoqSubscription second = await subscriber.SubscribeAsync(track, ct);
+        second.TrackAlias.Should().NotBe(firstAlias, "each subscription gets its own alias");
+
+        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, second.TrackAlias, ct);
+        await using (MoqGroupWriter group = await published.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct))
+        {
+            await group.WriteObjectAsync(0, Encoding.UTF8.GetBytes("frame"), cancellationToken: ct);
+            await group.CompleteAsync(ct);
+        }
+
+        SubgroupHeader header = await headerTask;
+        header.TrackAlias.Should().Be(second.TrackAlias, "objects go where the newest subscription says");
+        published.CurrentAlias.Should().Be(second.TrackAlias);
+
+        await runCts.CancelAsync();
+        try
+        {
+            await run;
+        }
+        catch (OperationCanceledException)
+        {
+            // the demux loop is cancelled once the flow is verified
+        }
+    }
+
+    /// <summary>
+    /// A publisher waiting for a subscriber gives up when the session it would arrive on is gone.
+    /// The wait is the whole hazard: a publisher that has announced and has no subscribers yet is
+    /// silent by design, so a connection can die under it with nothing to notice — and then a track
+    /// waits for a subscriber that has no way of ever arriving, while the demux loop's exception
+    /// goes to a task nobody awaited.
+    /// </summary>
+    [Fact]
+    public async Task WhenTheSessionDies_TracksStopWaitingForASubscriber()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack published = publisher.PublishTrack(FullTrackName.FromStrings(["live"], "video0"));
+        Task run = publisher.RunAsync(ct);
+
+        // Nobody ever subscribes; the connection goes away instead.
+        ValueTask<MoqGroupWriter> waiting = published.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct);
+        await subSession.DisposeAsync();
+        await clientConn.DisposeAsync();
+
+        Func<Task> act = async () => await waiting;
+        await act.Should().ThrowAsync<Exception>("a subscriber cannot arrive on a connection that is gone");
+
+        // `run` is this test's own task; awaiting it is not the foreign-task hazard VSTHRD003 warns of.
+#pragma warning disable VSTHRD003
+        Func<Task> loop = async () => await run;
+#pragma warning restore VSTHRD003
+        await loop.Should().ThrowAsync<Exception>("the demux loop reports what stopped it");
+
+        // And a track declared after the fact is not left waiting either.
+        MoqPublishedTrack late = publisher.PublishTrack(FullTrackName.FromStrings(["live"], "audio0"));
+        Func<Task> lateWait = async () => await late.BeginGroupAsync(0, publisherPriority: 100, cancellationToken: ct);
+        await lateWait.Should().ThrowAsync<Exception>();
+    }
+
     private static async Task<SubgroupHeader> FirstSubgroupHeaderAsync(IQuicConnection connection, ulong alias,
         CancellationToken ct)
     {

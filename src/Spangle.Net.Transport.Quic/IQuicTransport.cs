@@ -144,6 +144,19 @@ public sealed record QuicClientOptions
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// How often to send a PING on an otherwise silent connection, keeping it out of the idle
+    /// timeout. Null leaves it off, which is QUIC's own default.
+    /// <para>
+    /// A MoQ publisher wants this. Having announced a namespace it may sit silent for as long as
+    /// nobody subscribes, and silence is indistinguishable from death: the peer closes the
+    /// connection and the relay forgets the namespace with it, so subscribers are told the track
+    /// does not exist. Raising <see cref="IdleTimeout"/> alone does not fix it — QUIC's effective
+    /// idle timeout is the smaller of the two peers' values, and the peer's is not ours to set.
+    /// </para>
+    /// </summary>
+    public TimeSpan? KeepAliveInterval { get; init; }
+
+    /// <summary>
     /// How many inbound streams the server may have open at once. QUIC defaults this to 0,
     /// which makes AcceptStreamAsync fail, so both directions are granted this credit.
     /// </summary>

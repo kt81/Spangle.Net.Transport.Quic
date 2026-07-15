@@ -83,6 +83,7 @@ public sealed class MsQuicTransport : IQuicTransport
             DefaultStreamErrorCode = 0,
             DefaultCloseErrorCode = 0,
             IdleTimeout = options.IdleTimeout,
+            KeepAliveInterval = options.KeepAliveInterval ?? Timeout.InfiniteTimeSpan,
             MaxInboundUnidirectionalStreams = options.MaxConcurrentInboundStreams,
             MaxInboundBidirectionalStreams = options.MaxConcurrentInboundStreams,
             ClientAuthenticationOptions = clientAuthentication,
