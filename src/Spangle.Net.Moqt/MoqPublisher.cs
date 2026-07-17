@@ -112,7 +112,7 @@ public sealed class MoqPublisher
                 MoqIncomingStream incoming;
                 try
                 {
-                    incoming = await MoqStreamRouter.AcceptAsync(_session.Connection, cancellationToken)
+                    incoming = await MoqStreamRouter.AcceptAsync(_session.Connection, limits: null, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
@@ -122,13 +122,18 @@ public sealed class MoqPublisher
 
                 if (incoming is not MoqRequestStream request || request.MessageType != MoqControlMessageType.Subscribe)
                 {
-                    continue; // this cut only handles SUBSCRIBE request streams
+                    // This cut only handles SUBSCRIBE request streams — but the stream was
+                    // accepted, and an accepted stream holds inbound-stream credit until it is
+                    // closed. Kept undisposed, enough of them wedge the peer's OpenStreamAsync.
+                    await incoming.Stream.DisposeAsync().ConfigureAwait(false);
+                    continue;
                 }
 
                 SubscribeMessage subscribe = SubscribeMessage.DecodePayload(request.Payload.Span);
                 if (!_tracks.TryGetValue(Key(subscribe.Track), out MoqPublishedTrack? track))
                 {
                     request.Stream.Abort(0); // unknown track; no SUBSCRIBE_ERROR in this cut
+                    await request.Stream.DisposeAsync().ConfigureAwait(false);
                     continue;
                 }
 

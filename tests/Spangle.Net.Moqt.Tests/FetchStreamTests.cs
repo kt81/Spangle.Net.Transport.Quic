@@ -200,7 +200,7 @@ public class FetchStreamTests
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await pair.Peer.AcceptStreamAsync(ct);
-        var reader = await FetchStreamReader.OpenAsync(inbound, MoqGroupOrder.Descending, ct);
+        var reader = await FetchStreamReader.OpenAsync(inbound, MoqGroupOrder.Descending, cancellationToken: ct);
 
         var groups = new List<ulong>();
         while (await reader.ReadEntryAsync(ct) is MoqFetchedObject fetched)
@@ -376,7 +376,7 @@ public class FetchStreamTests
         await writer.WriteObjectAsync(MoqObject.Normal(1, 0, 0, 1, Encoding.UTF8.GetBytes("p")), ct);
         await writer.CompleteAsync(ct);
 
-        MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(pair.Peer, ct);
+        MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(pair.Peer, cancellationToken: ct);
 
         MoqFetchStream fetchStream = incoming.Should().BeOfType<MoqFetchStream>().Subject;
         fetchStream.Header.RequestId.Should().Be(42UL);

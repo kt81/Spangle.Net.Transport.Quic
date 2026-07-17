@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Security;
 using System.Text;
@@ -69,7 +70,7 @@ public class SubgroupStreamTests
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
-        var reader = await SubgroupStreamReader.OpenAsync(inbound, ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, cancellationToken: ct);
 
         reader.Header.FirstObject.Should().BeTrue();
         reader.Header.InheritPriority.Should().BeTrue();
@@ -135,7 +136,7 @@ public class SubgroupStreamTests
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
-        var reader = await SubgroupStreamReader.OpenAsync(inbound, ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, cancellationToken: ct);
         reader.Header.HasProperties.Should().BeTrue();
 
         MoqObject? first = await reader.ReadObjectAsync(ct);
@@ -198,7 +199,7 @@ public class SubgroupStreamTests
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
-        var reader = await SubgroupStreamReader.OpenAsync(inbound, ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, cancellationToken: ct);
 
         reader.Header.TrackAlias.Should().Be(7UL);
         reader.Header.GroupId.Should().Be(3UL);
@@ -218,5 +219,90 @@ public class SubgroupStreamTests
         Encoding.UTF8.GetString(objects[2].Payload.Span).Should().Be("ccc");
         objects[3].Status.Should().Be(MoqObjectStatus.EndOfGroup);
         objects[3].Payload.IsEmpty.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DeclaredPayloadLength_BeyondTheLimit_IsRejectedBeforeAllocating()
+    {
+        // The length prefix arrives before the bytes it promises: a peer can declare a
+        // gigabyte and send nothing, so the reader must reject the declaration itself —
+        // otherwise the allocation lands before QUIC flow control ever gets a say.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        ValueTask<IQuicConnection> acceptTask = server.AcceptConnectionAsync(ct);
+        await using IQuicConnection clientConn = await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        await using IQuicConnection serverConn = await acceptTask;
+
+        // Hand-written wire: SubgroupIdMode.Zero and DEFAULT_PRIORITY select no extra header
+        // fields, so the stream is type, alias, group, then one object with a lying length.
+        var header = new SubgroupHeader
+        {
+            TrackAlias = 1, GroupId = 0, SubgroupIdMode = SubgroupIdMode.Zero, InheritPriority = true,
+        };
+        var wire = new ArrayBufferWriter<byte>();
+        var w = new MoqWriter(wire);
+        w.WriteVarInt(header.Type);
+        w.WriteVarInt(1); // track alias
+        w.WriteVarInt(0); // group id
+        w.WriteVarInt(0); // first object: id delta
+        w.WriteVarInt(1UL << 30); // one declared gigabyte, never sent
+
+        await using IQuicStream outbound = await clientConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        await outbound.WriteAsync(wire.WrittenMemory, completeWrites: true, ct);
+
+        await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, cancellationToken: ct);
+        Func<Task> act = async () => await reader.ReadObjectAsync(ct);
+        await act.Should().ThrowAsync<MoqProtocolException>().WithMessage("*limit*");
+    }
+
+    [Fact]
+    public async Task ReadLimits_BoundTheAcceptedObjectPayload()
+    {
+        // A deployment that knows its objects are small can say so: past the configured
+        // bound is a protocol error, not an allocation.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        ValueTask<IQuicConnection> acceptTask = server.AcceptConnectionAsync(ct);
+        await using IQuicConnection clientConn = await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        await using IQuicConnection serverConn = await acceptTask;
+
+        var header = new SubgroupHeader
+        {
+            TrackAlias = 1, GroupId = 0, SubgroupIdMode = SubgroupIdMode.Explicit, SubgroupId = 0,
+            PublisherPriority = 0,
+        };
+        await using IQuicStream outbound = await clientConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        var writer = new SubgroupStreamWriter(outbound, header);
+        await writer.WriteObjectAsync(MoqObject.Normal(0, 0, 0, 0, new byte[8]), ct);
+        await writer.CompleteAsync(ct);
+
+        await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound,
+            new MoqReadLimits { MaxObjectPayloadLength = 4 }, ct);
+        Func<Task> act = async () => await reader.ReadObjectAsync(ct);
+        await act.Should().ThrowAsync<MoqProtocolException>().WithMessage("*limit*");
     }
 }

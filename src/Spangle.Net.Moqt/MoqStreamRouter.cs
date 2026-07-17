@@ -15,27 +15,46 @@ namespace Spangle.Net.Moqt;
 /// </summary>
 public static class MoqStreamRouter
 {
-    /// <summary>Accepts the next stream on <paramref name="connection"/> and classifies it.</summary>
+    /// <summary>The PADDING stream type (§3.4): carries no MOQT data, only bytes to discard.</summary>
+    private const ulong PaddingStreamType = 0x132B3E28;
+
+    /// <summary>
+    /// Accepts the next MOQT stream on <paramref name="connection"/> and classifies it. A PADDING
+    /// stream never comes back from here: its bytes are discarded in the background (§11.5.1) and
+    /// the accept loop continues to the next stream.
+    /// </summary>
     public static async ValueTask<MoqIncomingStream> AcceptAsync(IQuicConnection connection,
-        CancellationToken cancellationToken = default)
+        MoqReadLimits? limits = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(connection);
-        IQuicStream stream = await connection.AcceptStreamAsync(cancellationToken).ConfigureAwait(false);
-        return await ClassifyAsync(stream, cancellationToken).ConfigureAwait(false);
+        while (true)
+        {
+            IQuicStream stream = await connection.AcceptStreamAsync(cancellationToken).ConfigureAwait(false);
+            MoqIncomingStream incoming = await ClassifyAsync(stream, limits, cancellationToken).ConfigureAwait(false);
+            if (incoming is MoqPaddingStream padding)
+            {
+                padding.BeginDiscard();
+                continue;
+            }
+
+            return incoming;
+        }
     }
 
     /// <summary>
     /// Classifies an already-accepted <paramref name="stream"/>, reading its leading element: a
     /// bidirectional stream is a request stream (its first control message is read), and a
     /// unidirectional stream leads with a type varint that selects its data stream — a
-    /// SUBGROUP_HEADER or a FETCH_HEADER (§3.4, Table 3). Throws
+    /// SUBGROUP_HEADER or a FETCH_HEADER (§3.4, Table 3). A PADDING stream classifies as
+    /// <see cref="MoqPaddingStream"/>, whose bytes the spec says to discard (§11.5.1). Throws
     /// <see cref="MoqProtocolException"/> on any other unidirectional type, which the spec says
     /// an endpoint MUST close the session over rather than skip.
     /// </summary>
     public static async ValueTask<MoqIncomingStream> ClassifyAsync(IQuicStream stream,
-        CancellationToken cancellationToken = default)
+        MoqReadLimits? limits = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        limits ??= MoqReadLimits.Default;
 
         if (stream.Direction == QuicStreamDirection.Bidirectional)
         {
@@ -45,16 +64,21 @@ public static class MoqStreamRouter
         }
 
         ulong streamType = await StreamIo.ReadVarIntAsync(stream, cancellationToken).ConfigureAwait(false);
+        if (streamType == PaddingStreamType)
+        {
+            return new MoqPaddingStream(stream);
+        }
+
         if (streamType == FetchHeader.StreamType)
         {
             FetchHeader fetchHeader = await FetchHeader.ReadAfterTypeAsync(stream, cancellationToken)
                 .ConfigureAwait(false);
-            return new MoqFetchStream(stream, fetchHeader);
+            return new MoqFetchStream(stream, fetchHeader, limits);
         }
 
         SubgroupHeader header = await SubgroupHeader.ReadAfterTypeAsync(stream, streamType, cancellationToken)
             .ConfigureAwait(false);
-        return new MoqSubgroupStream(stream, SubgroupStreamReader.Create(stream, header));
+        return new MoqSubgroupStream(stream, SubgroupStreamReader.Create(stream, header, limits));
     }
 }
 
@@ -112,10 +136,15 @@ public sealed class MoqSubgroupStream : MoqIncomingStream
 /// </summary>
 public sealed class MoqFetchStream : MoqIncomingStream
 {
+    private readonly MoqReadLimits _limits;
     private bool _opened;
 
-    internal MoqFetchStream(IQuicStream stream, FetchHeader header)
-        : base(stream) => Header = header;
+    internal MoqFetchStream(IQuicStream stream, FetchHeader header, MoqReadLimits limits)
+        : base(stream)
+    {
+        Header = header;
+        _limits = limits;
+    }
 
     /// <summary>The FETCH_HEADER, whose Request ID names the FETCH this stream answers.</summary>
     public FetchHeader Header { get; }
@@ -132,6 +161,47 @@ public sealed class MoqFetchStream : MoqIncomingStream
         }
 
         _opened = true;
-        return FetchStreamReader.Create(Stream, Header, groupOrder);
+        return FetchStreamReader.Create(Stream, Header, groupOrder, _limits);
+    }
+}
+
+/// <summary>
+/// A unidirectional PADDING stream (§3.4, §11.5.1): it carries no MOQT data, and the spec has
+/// its receiver discard the bytes — not reset the stream, which would tell an observer the
+/// padding apart from data, and not treat it as unknown, which would close the session.
+/// <see cref="MoqStreamRouter.AcceptAsync"/> handles these itself; only a direct
+/// <see cref="MoqStreamRouter.ClassifyAsync"/> caller ever sees one, and calls
+/// <see cref="BeginDiscard"/> on it.
+/// </summary>
+public sealed class MoqPaddingStream : MoqIncomingStream
+{
+    internal MoqPaddingStream(IQuicStream stream) : base(stream)
+    {
+    }
+
+    /// <summary>
+    /// Discards the stream's bytes in the background until it ends, then disposes it. Errors are
+    /// ignored: nothing about a padding stream is worth reporting, and the drain task ends with
+    /// the stream (or the connection under it) in every case.
+    /// </summary>
+    public void BeginDiscard() => _ = DiscardAsync();
+
+    private async Task DiscardAsync()
+    {
+        var scratch = new byte[4096];
+        try
+        {
+            while (await Stream.ReadAsync(scratch, CancellationToken.None).ConfigureAwait(false) > 0)
+            {
+            }
+        }
+        catch (Exception)
+        {
+            // A padding stream failing is of no consequence; the dispose below returns its credit.
+        }
+        finally
+        {
+            await Stream.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }

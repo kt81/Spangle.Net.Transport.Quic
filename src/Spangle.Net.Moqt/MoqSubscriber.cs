@@ -116,7 +116,8 @@ public sealed class MoqSubscription : IAsyncDisposable
             MoqIncomingStream incoming;
             try
             {
-                incoming = await MoqStreamRouter.AcceptAsync(_connection, cancellationToken).ConfigureAwait(false);
+                incoming = await MoqStreamRouter.AcceptAsync(_connection, limits: null, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -125,7 +126,12 @@ public sealed class MoqSubscription : IAsyncDisposable
 
             if (incoming is not MoqSubgroupStream subgroup || subgroup.Reader.Header.TrackAlias != TrackAlias)
             {
-                continue; // control/request streams and other tracks are not ours
+                // Control/request streams and other tracks are not ours — but the stream was
+                // accepted, and an accepted stream holds inbound-stream credit until it is
+                // closed. Kept undisposed, enough of them wedge the peer's OpenStreamAsync.
+                // (This facade is one subscription per connection, so no one else wants it.)
+                await incoming.Stream.DisposeAsync().ConfigureAwait(false);
+                continue;
             }
 
             while (await subgroup.Reader.ReadObjectAsync(cancellationToken).ConfigureAwait(false) is { } moqObject)

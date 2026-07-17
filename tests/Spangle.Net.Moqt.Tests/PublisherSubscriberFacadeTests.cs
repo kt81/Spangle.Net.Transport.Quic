@@ -234,7 +234,7 @@ public class PublisherSubscriberFacadeTests
     {
         while (true)
         {
-            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(connection, ct);
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(connection, cancellationToken: ct);
             if (incoming is MoqSubgroupStream subgroup && subgroup.Reader.Header.TrackAlias == alias)
             {
                 return subgroup.Reader.Header;

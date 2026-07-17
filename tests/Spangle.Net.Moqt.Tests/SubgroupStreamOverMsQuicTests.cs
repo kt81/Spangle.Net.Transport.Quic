@@ -66,7 +66,7 @@ public class SubgroupStreamOverMsQuicTests
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
-        var reader = await SubgroupStreamReader.OpenAsync(inbound, ct);
+        var reader = await SubgroupStreamReader.OpenAsync(inbound, cancellationToken: ct);
         reader.Header.TrackAlias.Should().Be(42UL);
 
         var payloads = new List<string>();

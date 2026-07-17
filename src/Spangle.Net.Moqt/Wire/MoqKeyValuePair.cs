@@ -116,6 +116,16 @@ public static class KeyValuePairCodec
     /// <summary>Reads exactly <paramref name="count"/> pairs.</summary>
     public static IReadOnlyList<MoqKeyValuePair> ReadCounted(ref MoqReader reader, int count)
     {
+        // A pair takes at least two bytes (a type varint and a value varint or length), so a
+        // count beyond that bound is a lie. It has to be rejected before it sizes the list:
+        // the count arrives as a varint the peer controls, and believing it would turn a
+        // few-byte message into a multi-gigabyte allocation.
+        if (count > reader.Remaining / 2)
+        {
+            throw new MoqProtocolException(
+                $"Parameter count {count} cannot fit the {reader.Remaining} bytes that remain.");
+        }
+
         var pairs = new List<MoqKeyValuePair>(count);
         ulong previousType = 0;
         for (int i = 0; i < count; i++)

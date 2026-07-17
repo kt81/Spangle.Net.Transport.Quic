@@ -78,7 +78,7 @@ public class PubSubFlowTests
 
         // receive the track's objects on the subgroup stream carrying that alias
         await using IQuicStream data = await connection.AcceptStreamAsync(ct);
-        var reader = await SubgroupStreamReader.OpenAsync(data, ct);
+        var reader = await SubgroupStreamReader.OpenAsync(data, cancellationToken: ct);
         reader.Header.TrackAlias.Should().Be(ok.TrackAlias);
 
         var payloads = new List<string>();

@@ -59,7 +59,7 @@ public class MoqStreamRouterTests
             ControlMessage.Write(frame, MoqControlMessageType.Subscribe, payload.WrittenSpan);
             await request.WriteAsync(frame.WrittenMemory, completeWrites: false, ct);
 
-            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(serverConn, ct);
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(serverConn, cancellationToken: ct);
 
             var req = incoming.Should().BeOfType<MoqRequestStream>().Subject;
             req.MessageType.Should().Be(MoqControlMessageType.Subscribe);
@@ -97,13 +97,58 @@ public class MoqStreamRouterTests
             await writer.WriteObjectAsync(MoqObject.Normal(0, 0, 0, 100, Encoding.UTF8.GetBytes("f0")), ct);
             await writer.CompleteAsync(ct);
 
-            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(serverConn, ct);
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(serverConn, cancellationToken: ct);
 
             var sub = incoming.Should().BeOfType<MoqSubgroupStream>().Subject;
             sub.Reader.Header.TrackAlias.Should().Be(42UL);
             MoqObject? first = await sub.Reader.ReadObjectAsync(ct);
             first.Should().NotBeNull();
             Encoding.UTF8.GetString(first!.Payload.Span).Should().Be("f0");
+        }
+    }
+
+    [Fact]
+    public async Task Accept_PaddingStream_IsDiscardedAndTheNextRealStreamComesBack()
+    {
+        // PADDING (type 0x132B3E28, §3.4) carries no MOQT data and §11.5.1 has the receiver
+        // discard its bytes. It used to fall through to the SUBGROUP_HEADER parser and close
+        // the whole session — a spec-conformant peer's padding was fatal.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        (IQuicConnection client, IQuicConnection serverConn) = await ConnectPairAsync(transport, server, ct);
+
+        await using (client)
+        await using (serverConn)
+        {
+            await using IQuicStream padding =
+                await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+            var head = new ArrayBufferWriter<byte>();
+            new MoqWriter(head).WriteVarInt(0x132B3E28);
+            await padding.WriteAsync(head.WrittenMemory, completeWrites: false, ct);
+            await padding.WriteAsync(new byte[1024], completeWrites: true, ct);
+
+            await using IQuicStream data =
+                await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+            var header = new SubgroupHeader
+            {
+                TrackAlias = 7, GroupId = 0, SubgroupIdMode = SubgroupIdMode.Explicit, SubgroupId = 0,
+                PublisherPriority = 100,
+            };
+            var writer = new SubgroupStreamWriter(data, header);
+            await writer.WriteObjectAsync(MoqObject.Normal(0, 0, 0, 100, Encoding.UTF8.GetBytes("f0")), ct);
+            await writer.CompleteAsync(ct);
+
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(serverConn, cancellationToken: ct);
+
+            var sub = incoming.Should().BeOfType<MoqSubgroupStream>().Subject;
+            sub.Reader.Header.TrackAlias.Should().Be(7UL);
         }
     }
 }

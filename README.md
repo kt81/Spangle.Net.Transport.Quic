@@ -55,7 +55,7 @@ streams; [`MoqStreamRouter`](src/Spangle.Net.Moqt/MoqStreamRouter.cs) classifies
 the caller never reads a stream-type varint by hand:
 
 ```csharp
-switch (await MoqStreamRouter.AcceptAsync(connection, ct))
+switch (await MoqStreamRouter.AcceptAsync(connection, cancellationToken: ct))
 {
     case MoqRequestStream req when req.MessageType == MoqControlMessageType.Subscribe:
         var subscribe = SubscribeMessage.DecodePayload(req.Payload.Span); // reply on req.Stream

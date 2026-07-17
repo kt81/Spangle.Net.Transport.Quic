@@ -11,13 +11,15 @@ namespace Spangle.Net.Moqt.Data;
 public sealed class SubgroupStreamReader
 {
     private readonly IQuicStream _stream;
+    private readonly MoqReadLimits _limits;
     private ulong _previousObjectId;
     private ulong _resolvedSubgroupId;
     private bool _first = true;
 
-    private SubgroupStreamReader(IQuicStream stream, SubgroupHeader header)
+    private SubgroupStreamReader(IQuicStream stream, SubgroupHeader header, MoqReadLimits limits)
     {
         _stream = stream;
+        _limits = limits;
         Header = header;
     }
 
@@ -26,15 +28,16 @@ public sealed class SubgroupStreamReader
 
     /// <summary>Reads the header and returns a reader positioned at the first object.</summary>
     public static async ValueTask<SubgroupStreamReader> OpenAsync(IQuicStream stream,
-        CancellationToken cancellationToken = default)
+        MoqReadLimits? limits = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
         SubgroupHeader header = await SubgroupHeader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
-        return new SubgroupStreamReader(stream, header);
+        return new SubgroupStreamReader(stream, header, limits ?? MoqReadLimits.Default);
     }
 
     /// <summary>Wraps a stream whose SUBGROUP_HEADER a caller has already read.</summary>
-    internal static SubgroupStreamReader Create(IQuicStream stream, SubgroupHeader header) => new(stream, header);
+    internal static SubgroupStreamReader Create(IQuicStream stream, SubgroupHeader header, MoqReadLimits limits) =>
+        new(stream, header, limits);
 
     /// <summary>Reads the next object, or null once the stream has FIN'd at an object boundary.</summary>
     public async ValueTask<MoqObject?> ReadObjectAsync(CancellationToken cancellationToken = default)
@@ -56,7 +59,9 @@ public sealed class SubgroupStreamReader
             ulong propertiesLength = await StreamIo.ReadVarIntAsync(_stream, cancellationToken).ConfigureAwait(false);
             if (propertiesLength > 0)
             {
-                byte[] block = await StreamIo.ReadExactAsync(_stream, ToLength(propertiesLength), cancellationToken)
+                byte[] block = await StreamIo
+                    .ReadExactAsync(_stream, ToLength(propertiesLength, _limits.MaxPropertiesLength),
+                        cancellationToken)
                     .ConfigureAwait(false);
                 var reader = new MoqReader(block);
                 extensions = KeyValuePairCodec.ReadList(ref reader);
@@ -81,7 +86,8 @@ public sealed class SubgroupStreamReader
         else
         {
             status = MoqObjectStatus.Normal;
-            payload = await StreamIo.ReadExactAsync(_stream, ToLength(payloadLength), cancellationToken)
+            payload = await StreamIo
+                .ReadExactAsync(_stream, ToLength(payloadLength, _limits.MaxObjectPayloadLength), cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -100,11 +106,13 @@ public sealed class SubgroupStreamReader
             extensions);
     }
 
-    private static int ToLength(ulong value)
+    // The length arrives before the bytes it promises, so it is checked against the limit
+    // before it becomes an allocation — not after.
+    private static int ToLength(ulong value, int max)
     {
-        if (value > int.MaxValue)
+        if (value > (ulong)max)
         {
-            throw new MoqProtocolException($"Length {value} exceeds the supported maximum.");
+            throw new MoqProtocolException($"Length {value} exceeds the limit of {max} bytes.");
         }
 
         return (int)value;

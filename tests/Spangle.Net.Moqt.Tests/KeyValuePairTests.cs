@@ -90,4 +90,34 @@ public class KeyValuePairTests
         Action act = () => MoqKeyValuePair.FromBytes(0x04, [0x00]);
         act.Should().Throw<ArgumentException>();
     }
+
+    [Fact]
+    public void ReadCounted_CountBeyondTheRemainingBytes_IsRejectedBeforeAllocating()
+    {
+        // The count is a varint the peer controls: a control message capped at 65,535 bytes
+        // can still claim int.MaxValue pairs, and the count used to size a List allocation
+        // before a single pair was read.
+        Action act = () =>
+        {
+            var reader = new MoqReader([0x00, 0x00]);
+            KeyValuePairCodec.ReadCounted(ref reader, int.MaxValue);
+        };
+        act.Should().Throw<MoqProtocolException>().WithMessage("*count*");
+    }
+
+    [Fact]
+    public void ReadCounted_CountThatExactlyFits_IsAccepted()
+    {
+        // Two pairs of two bytes each: the tightest packing the guard must still let through.
+        var output = new ArrayBufferWriter<byte>();
+        KeyValuePairCodec.WriteCounted(new MoqWriter(output),
+            [MoqKeyValuePair.Varint(0x00, 1), MoqKeyValuePair.Varint(0x00, 2)]);
+
+        var reader = new MoqReader(output.WrittenSpan);
+        int count = reader.ReadVarIntAsInt32();
+        IReadOnlyList<MoqKeyValuePair> decoded = KeyValuePairCodec.ReadCounted(ref reader, count);
+
+        decoded.Should().HaveCount(2);
+        decoded[1].VarintValue.Should().Be(2UL);
+    }
 }

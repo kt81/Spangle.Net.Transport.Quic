@@ -14,6 +14,7 @@ public sealed class FetchStreamReader
 {
     private readonly IQuicStream _stream;
     private readonly MoqGroupOrder _groupOrder;
+    private readonly MoqReadLimits _limits;
 
     // Mirrors FetchStreamWriter's state: Group and Object advance on every entry, an End of Range
     // marker included, while Subgroup and Priority stay with the last real object (§11.4.4.2).
@@ -22,10 +23,11 @@ public sealed class FetchStreamReader
     private ulong? _priorSubgroupId;
     private byte? _priorPriority;
 
-    private FetchStreamReader(IQuicStream stream, FetchHeader header, MoqGroupOrder groupOrder)
+    private FetchStreamReader(IQuicStream stream, FetchHeader header, MoqGroupOrder groupOrder, MoqReadLimits limits)
     {
         _stream = stream;
         _groupOrder = groupOrder;
+        _limits = limits;
         Header = header;
     }
 
@@ -38,16 +40,18 @@ public sealed class FetchStreamReader
     /// decides whether a Group ID Delta counts up or down.
     /// </summary>
     public static async ValueTask<FetchStreamReader> OpenAsync(IQuicStream stream,
-        MoqGroupOrder groupOrder = MoqGroupOrder.Ascending, CancellationToken cancellationToken = default)
+        MoqGroupOrder groupOrder = MoqGroupOrder.Ascending, MoqReadLimits? limits = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
         FetchHeader header = await FetchHeader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
-        return new FetchStreamReader(stream, header, groupOrder);
+        return new FetchStreamReader(stream, header, groupOrder, limits ?? MoqReadLimits.Default);
     }
 
     /// <summary>Wraps a stream whose FETCH_HEADER a caller has already read.</summary>
-    internal static FetchStreamReader Create(IQuicStream stream, FetchHeader header, MoqGroupOrder groupOrder) =>
-        new(stream, header, groupOrder);
+    internal static FetchStreamReader Create(IQuicStream stream, FetchHeader header, MoqGroupOrder groupOrder,
+        MoqReadLimits limits) =>
+        new(stream, header, groupOrder, limits);
 
     /// <summary>Reads the next entry, or null once the stream has FIN'd at an entry boundary.</summary>
     public async ValueTask<MoqFetchEntry?> ReadEntryAsync(CancellationToken cancellationToken = default)
@@ -109,7 +113,9 @@ public sealed class FetchStreamReader
             ulong propertiesLength = await StreamIo.ReadVarIntAsync(_stream, cancellationToken).ConfigureAwait(false);
             if (propertiesLength > 0)
             {
-                byte[] block = await StreamIo.ReadExactAsync(_stream, ToLength(propertiesLength), cancellationToken)
+                byte[] block = await StreamIo
+                    .ReadExactAsync(_stream, ToLength(propertiesLength, _limits.MaxPropertiesLength),
+                        cancellationToken)
                     .ConfigureAwait(false);
                 var reader = new MoqReader(block);
                 extensions = KeyValuePairCodec.ReadList(ref reader);
@@ -121,7 +127,9 @@ public sealed class FetchStreamReader
         ulong payloadLength = await StreamIo.ReadVarIntAsync(_stream, cancellationToken).ConfigureAwait(false);
         ReadOnlyMemory<byte> payload = payloadLength == 0
             ? ReadOnlyMemory<byte>.Empty
-            : await StreamIo.ReadExactAsync(_stream, ToLength(payloadLength), cancellationToken).ConfigureAwait(false);
+            : await StreamIo
+                .ReadExactAsync(_stream, ToLength(payloadLength, _limits.MaxObjectPayloadLength), cancellationToken)
+                .ConfigureAwait(false);
 
         _priorGroupId = groupId;
         _priorObjectId = objectId;
@@ -261,11 +269,13 @@ public sealed class FetchStreamReader
         }
     }
 
-    private static int ToLength(ulong value)
+    // The length arrives before the bytes it promises, so it is checked against the limit
+    // before it becomes an allocation — not after.
+    private static int ToLength(ulong value, int max)
     {
-        if (value > int.MaxValue)
+        if (value > (ulong)max)
         {
-            throw new MoqProtocolException($"Length {value} exceeds the supported maximum.");
+            throw new MoqProtocolException($"Length {value} exceeds the limit of {max} bytes.");
         }
 
         return (int)value;
