@@ -22,4 +22,29 @@
     <PackageReference Include="Microsoft.VisualStudio.Threading.Analyzers" Version="18.7.23" PrivateAssets="all" />
   </ItemGroup>
 
+  <!-- Nothing is packed unless it opts in (the two libraries do); this keeps tests out. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- Shared package identity and provenance. The two published libraries add their own
+       PackageId / Description / Tags; everything common to both lives here. -->
+  <PropertyGroup>
+    <Authors>Toshio Kumaki</Authors>
+    <Copyright>Copyright (c) Toshio Kumaki</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/kt81/Spangle.Net.Moqt</PackageProjectUrl>
+    <PackageReleaseNotes>https://github.com/kt81/Spangle.Net.Moqt/releases</PackageReleaseNotes>
+    <RepositoryUrl>https://github.com/kt81/Spangle.Net.Moqt.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <!-- Source Link: debuggable, verifiable sources (built into the SDK for GitHub repos) -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
 </Project>

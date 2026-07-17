@@ -12,6 +12,19 @@
          which System.Net.Quic requires for dual-mode sockets) is unavailable. -->
   </PropertyGroup>
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Spangle.Net.Transport.Quic</PackageId>
+    <Title>Spangle.Net.Transport.Quic - a QUIC seam for .NET</Title>
+    <Description>A small QUIC abstraction with two interchangeable backends: the real System.Net.Quic over native msquic, and an in-process loopback wired with System.IO.Pipelines that needs no msquic or IPv6. It lets a QUIC-based protocol (such as MOQT) be built and tested where msquic is unavailable, and leaves room for msquic features System.Net.Quic does not surface. Knows nothing about MoQ, so any QUIC protocol can target it.</Description>
+    <PackageTags>quic;msquic;system-net-quic;transport;networking;pipelines;system-io-pipelines;moq;media-over-quic;http3</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../assets/icon.png" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="Spangle.Net.Transport.Quic.Tests" />
   </ItemGroup>

@@ -4,11 +4,18 @@ Spangle.Net.Moqt
 [![Build and Test](https://github.com/kt81/Spangle.Net.Moqt/actions/workflows/build_test.yml/badge.svg)](https://github.com/kt81/Spangle.Net.Moqt/actions/workflows/build_test.yml)
 
 A [Media over QUIC Transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
-(MOQT) implementation for .NET, pinned to **draft-18** — the wire codec, control messages,
-the subgroup object data plane, and the session handshake. It is the reusable MIT building
-block that [Spangle](https://github.com/kt81/spangle) (an AGPL media server) embeds and
-drives; the media mapping itself (CMAF/CMSF frames) stays in the Spangle core, which writes
-only the bridge onto the types here.
+(MOQT) implementation for .NET, pinned to **draft-18** — the wire codec (MoQ variable-length
+integers, Key-Value-Pairs, control-message framing), all of the draft's control messages, the
+subgroup object data plane with Extension Headers, FETCH, the session handshake, and
+publisher / subscriber facades over it. It is the reusable MIT building block that
+[Spangle](https://github.com/kt81/spangle) (an AGPL media server) embeds and drives; the
+media mapping itself (LOC, CMSF, catalogs) stays in the consumer, which writes only the
+bridge onto the types here.
+
+Every piece is checked against the reference relay (moxygen) over raw QUIC — the wire codec,
+the control messages, the extension headers, the subgroup and FETCH data planes — so what is
+on the wire is what an independent implementation reads, not only what round-trips through
+this one.
 
 > Pre-1.0 / under active development. Interfaces may change without notice.
 
@@ -21,7 +28,7 @@ alone:
 
 | Package | What it is |
 |---|---|
-| **`Spangle.Net.Moqt`** | The MOQT protocol: the [`Wire`](src/Spangle.Net.Moqt/Wire) codec (QUIC var-ints, length-prefixed strings, Key-Value-Pairs, control-message framing), [`Messages`](src/Spangle.Net.Moqt/Messages) (SETUP, SUBSCRIBE, SUBSCRIBE_OK), the [subgroup](src/Spangle.Net.Moqt/Data) object data plane, and [`MoqSession`](src/Spangle.Net.Moqt/MoqSession.cs) — the control-stream handshake. |
+| **`Spangle.Net.Moqt`** | The MOQT protocol: the [`Wire`](src/Spangle.Net.Moqt/Wire) codec (MoQ variable-length integers, length-prefixed strings, Key-Value-Pairs, control-message framing), the draft-18 [`Messages`](src/Spangle.Net.Moqt/Messages) (SETUP, SUBSCRIBE, PUBLISH, FETCH, the namespace and request messages, GOAWAY, …), the [subgroup and FETCH](src/Spangle.Net.Moqt/Data) object data planes with Extension Headers, [`MoqSession`](src/Spangle.Net.Moqt/MoqSession.cs) — the control-stream handshake — and [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) / [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs) facades that offer and pull tracks without touching the wire. |
 | **`Spangle.Net.Transport.Quic`** | The QUIC seam it sits on: one interface, two interchangeable backends (below). Knows nothing about MoQ, so any QUIC-based protocol can target it. |
 
 Every wire constant is isolated in [`MoqtConstants`](src/Spangle.Net.Moqt/MoqtConstants.cs)
@@ -57,6 +64,23 @@ switch (await MoqStreamRouter.AcceptAsync(connection, ct))
         while (await sub.Reader.ReadObjectAsync(ct) is { } obj) { /* obj.Payload ... */ }
         break;
 }
+```
+
+**Or above the wire entirely.** [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) and
+[`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs) run the request-stream demux for you:
+a publisher declares its tracks and answers subscriptions; a subscriber asks for a track and
+reads its objects. Neither the caller nor these facades touches a varint.
+
+```csharp
+var publisher = MoqPublisher.Create(session);
+var track = publisher.PublishTrack(FullTrackName.FromStrings(["ns"], "video0"));
+_ = publisher.RunAsync(ct);                       // answers SUBSCRIBE with a Track Alias
+await using var group = await track.BeginGroupAsync(0, priority: 128, cancellationToken: ct);
+await group.WriteObjectAsync(0, payload, cancellationToken: ct);
+
+var subscriber = MoqSubscriber.Create(session);
+await using var sub = await subscriber.SubscribeAsync(FullTrackName.FromStrings(["ns"], "video0"), ct);
+await foreach (var obj in sub.ReadObjectsAsync(ct)) { /* obj.Payload ... */ }
 ```
 
 The QUIC seam

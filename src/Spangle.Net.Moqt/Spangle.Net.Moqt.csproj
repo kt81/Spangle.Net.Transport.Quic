@@ -13,12 +13,27 @@
          belongs in the Spangle core, which reuses this package and writes only the bridge. -->
   </PropertyGroup>
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Spangle.Net.Moqt</PackageId>
+    <Title>Spangle.Net.Moqt - Media over QUIC Transport for .NET</Title>
+    <Description>A Media over QUIC Transport (MOQT) implementation for .NET, pinned to draft-ietf-moq-transport-18: the wire codec (MoQ variable-length integers, Key-Value-Pairs, control-message framing), the control messages, the subgroup object data plane with Extension Headers, FETCH, and the session handshake — plus publisher/subscriber facades over it. It runs on a small QUIC seam (Spangle.Net.Transport.Quic) so the protocol is exercised over an in-memory backend where msquic is unavailable, and over real msquic in CI. Media mapping (LOC, CMSF, catalogs) is deliberately left to the consumer. Pre-1.0; interfaces may change.</Description>
+    <PackageTags>moq;moqt;media-over-quic;draft-ietf-moq-transport;quic;msquic;streaming;live-streaming;low-latency;video;transport;subgroup;fetch;catalog</PackageTags>
+  </PropertyGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="Spangle.Net.Moqt.Tests" />
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Packed, this becomes a NuGet dependency on Spangle.Net.Transport.Quic at the same
+         version (published from this same repo); locally it stays a project reference. -->
     <ProjectReference Include="..\Spangle.Net.Transport.Quic\Spangle.Net.Transport.Quic.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../assets/icon.png" Pack="true" PackagePath="/" />
   </ItemGroup>
 
 </Project>

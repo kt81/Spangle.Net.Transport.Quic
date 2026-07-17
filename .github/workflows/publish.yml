@@ -1,0 +1,56 @@
+name: Publish to NuGet
+
+# Bare version tags (e.g. 0.1.0) publish that version via Trusted Publishing:
+# the GitHub OIDC token is exchanged for a short-lived API key, so no long-lived
+# secret is stored anywhere. Each package's nuget.org trusted-publishing policy is
+# bound to this repository and this workflow file (publish.yml). Both packages
+# (Spangle.Net.Moqt and Spangle.Net.Transport.Quic) are pushed from the one run.
+on:
+  push:
+    tags: [ "[0-9]*.*.*" ]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for the GitHub OIDC token consumed by NuGet/login
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # A last gate before publishing. The in-memory backend covers the protocol on
+      # every host; the real msquic backend runs here best-effort (SPANGLE_REQUIRE_QUIC
+      # is left unset, so a host without it skips rather than fails).
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+
+      - name: Pack
+        # snupkg symbols come from the props (IncludeSymbols/SymbolPackageFormat).
+        # The transport is packed first so the Moqt package resolves its dependency.
+        run: |
+          dotnet pack src/Spangle.Net.Transport.Quic/Spangle.Net.Transport.Quic.csproj --no-build --configuration Release -p:Version=${GITHUB_REF_NAME} -p:ContinuousIntegrationBuild=true -o out
+          dotnet pack src/Spangle.Net.Moqt/Spangle.Net.Moqt.csproj --no-build --configuration Release -p:Version=${GITHUB_REF_NAME} -p:ContinuousIntegrationBuild=true -o out
+
+      - name: Show package contents
+        run: |
+          for pkg in out/*.nupkg; do echo "== $pkg =="; unzip -l "$pkg" | grep -E 'README|icon|lib/'; done
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: kt81
+
+      - name: Publish to NuGet
+        run: dotnet nuget push out/*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ steps.login.outputs.NUGET_API_KEY }}" --skip-duplicate
