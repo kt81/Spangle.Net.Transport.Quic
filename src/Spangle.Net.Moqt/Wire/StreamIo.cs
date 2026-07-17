@@ -56,7 +56,13 @@ internal static class StreamIo
             throw new MoqProtocolException("The stream ended in the middle of a variable-length integer.");
         }
 
-        VarInt.TryRead(bytes, out ulong value, out _);
+        if (!VarInt.TryRead(bytes, out ulong value, out _))
+        {
+            // Unreachable while GetEncodedLength and TryRead agree on the length prefix; if
+            // they ever drift, a silent value of 0 must not be the way anyone finds out.
+            throw new MoqProtocolException("The variable-length integer could not be decoded.");
+        }
+
         return value;
     }
 

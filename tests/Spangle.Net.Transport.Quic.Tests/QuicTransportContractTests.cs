@@ -162,6 +162,36 @@ public abstract class QuicTransportContractTests
     }
 
     [SkippableFact]
+    public async Task Cancellation_UnblocksAPendingRead()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        CancellationToken ct = cts.Token;
+        IQuicTransport transport = CreateTransport();
+        await using IQuicServer server = await transport.ListenAsync(NewServerOptions(Alpn), ct);
+        (IQuicConnection clientConn, IQuicConnection serverConn) = await ConnectPairAsync(transport, server, ct);
+        await using (clientConn)
+        await using (serverConn)
+        {
+            await using IQuicStream outbound = await clientConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+            await outbound.WriteAsync(new byte[] { 1 }, completeWrites: false, ct);
+            await using IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
+            await ReadExactlyAsync(inbound, 1, ct);
+
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task<int> blocked = inbound.ReadAsync(new byte[16], readCts.Token).AsTask();
+            await Task.Delay(50, ct);
+            await readCts.CancelAsync();
+
+            // `blocked` is this test's own read; awaiting it is not the foreign-task hazard
+            // VSTHRD003 warns about.
+#pragma warning disable VSTHRD003
+            Func<Task> act = async () => await blocked;
+#pragma warning restore VSTHRD003
+            await act.Should().ThrowAsync<OperationCanceledException>();
+        }
+    }
+
+    [SkippableFact]
     public async Task WriteAfterThePeerStopsReading_Throws()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));

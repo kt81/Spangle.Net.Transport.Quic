@@ -65,11 +65,21 @@ public sealed class MoqPublisher
         ControlMessage.Write(frame, MoqControlMessageType.PublishNamespace, payload.WrittenSpan);
         await request.WriteAsync(frame.WrittenMemory, completeWrites: false, cancellationToken).ConfigureAwait(false);
 
-        (ulong type, byte[] _) = await ControlMessage.ReadAsync(request, cancellationToken).ConfigureAwait(false);
+        (ulong type, byte[] okPayload) =
+            await ControlMessage.ReadAsync(request, cancellationToken).ConfigureAwait(false);
         if (type != MoqControlMessageType.RequestOk)
         {
             throw new MoqProtocolException(
                 $"Expected REQUEST_OK (0x{MoqControlMessageType.RequestOk:X}) after PUBLISH_NAMESPACE, got 0x{type:X}.");
+        }
+
+        RequestOkMessage ok = RequestOkMessage.DecodePayload(okPayload);
+        if (ok.TrackProperties.Count > 0)
+        {
+            // §10.5: Track Properties belong to TRACK_STATUS_OK alone; in any other REQUEST_OK
+            // flavour their presence is a protocol violation.
+            throw new MoqProtocolException(
+                "The REQUEST_OK answering PUBLISH_NAMESPACE must not carry Track Properties (§10.5).");
         }
     }
 

@@ -81,6 +81,14 @@ public sealed class SubgroupStreamReader
                 (ulong)MoqObjectStatus.EndOfTrack => MoqObjectStatus.EndOfTrack,
                 _ => throw new MoqProtocolException($"0x{raw:X} is not a valid Object Status."),
             };
+            if (status != MoqObjectStatus.Normal && properties.Count > 0)
+            {
+                // §11.2.1.2: only a Normal object may carry Object Properties; a status marker
+                // with properties is a protocol violation the session must end over.
+                throw new MoqProtocolException(
+                    $"A {status} object must not carry Object Properties (§11.2.1.2).");
+            }
+
             payload = ReadOnlyMemory<byte>.Empty;
         }
         else

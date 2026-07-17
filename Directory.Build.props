@@ -39,7 +39,7 @@
     <PackageReleaseNotes>https://github.com/kt81/Spangle.Net.Moqt/releases</PackageReleaseNotes>
     <RepositoryUrl>https://github.com/kt81/Spangle.Net.Moqt.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <VersionPrefix>0.1.0</VersionPrefix>
+    <VersionPrefix>0.2.0</VersionPrefix>
     <!-- Source Link: debuggable, verifiable sources (built into the SDK for GitHub repos) -->
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>

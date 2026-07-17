@@ -28,7 +28,7 @@ alone:
 
 | Package | What it is |
 |---|---|
-| **`Spangle.Net.Moqt`** | The MOQT protocol: the [`Wire`](src/Spangle.Net.Moqt/Wire) codec (MoQ variable-length integers, length-prefixed strings, Key-Value-Pairs, control-message framing), the draft-18 [`Messages`](src/Spangle.Net.Moqt/Messages) (SETUP, SUBSCRIBE, PUBLISH, FETCH, the namespace and request messages, GOAWAY, …), the [subgroup and FETCH](src/Spangle.Net.Moqt/Data) object data planes with Extension Headers, [`MoqSession`](src/Spangle.Net.Moqt/MoqSession.cs) — the control-stream handshake — and [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) / [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs) facades that offer and pull tracks without touching the wire. |
+| **`Spangle.Net.Moqt`** | The MOQT protocol: the [`Wire`](src/Spangle.Net.Moqt/Wire) codec (MoQ variable-length integers, length-prefixed strings, Key-Value-Pairs, control-message framing), the draft-18 [`Messages`](src/Spangle.Net.Moqt/Messages) (SETUP, SUBSCRIBE, PUBLISH, FETCH, the namespace and request messages, GOAWAY, …), the [subgroup and FETCH](src/Spangle.Net.Moqt/Data) object data planes with Object Properties, [`MoqSession`](src/Spangle.Net.Moqt/MoqSession.cs) — the control-stream handshake and the session's demux loop — and [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) / [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs) facades that offer and pull tracks without touching the wire. |
 | **`Spangle.Net.Transport.Quic`** | The QUIC seam it sits on: one interface, two interchangeable backends (below). Knows nothing about MoQ, so any QUIC-based protocol can target it. |
 
 Every wire constant is isolated in [`MoqtConstants`](src/Spangle.Net.Moqt/MoqtConstants.cs)
@@ -66,19 +66,25 @@ switch (await MoqStreamRouter.AcceptAsync(connection, cancellationToken: ct))
 }
 ```
 
-**Or above the wire entirely.** [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) and
-[`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs) run the request-stream demux for you:
-a publisher declares its tracks and answers subscriptions; a subscriber asks for a track and
-reads its objects. Neither the caller nor these facades touches a varint.
+**Or above the wire entirely.** The session runs one demux loop
+(`MoqSession.RunAsync`) that pumps the control stream (GOAWAY surfaces on
+`session.GoAwayReceived`) and routes every incoming stream to its owner — so any number of
+subscriptions can share a session without racing each other for streams.
+[`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) registers itself as the request
+handler and answers subscriptions; [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs)
+asks for a track and reads the objects the demux delivers for its Track Alias. Neither the
+caller nor these facades touches a varint. Read bounds against a lying peer live in
+`MoqSessionOptions.ReadLimits`, given once at `ConnectAsync` / `AcceptAsync`.
 
 ```csharp
 var publisher = MoqPublisher.Create(session);
 var track = publisher.PublishTrack(FullTrackName.FromStrings(["ns"], "video0"));
-_ = publisher.RunAsync(ct);                       // answers SUBSCRIBE with a Track Alias
+_ = publisher.RunAsync(ct);                       // the session demux; answers SUBSCRIBE
 await using var group = await track.BeginGroupAsync(0, priority: 128, cancellationToken: ct);
 await group.WriteObjectAsync(0, payload, cancellationToken: ct);
 
-var subscriber = MoqSubscriber.Create(session);
+var subscriber = MoqSubscriber.Create(subSession);
+_ = subSession.RunAsync(ct);                      // the subscriber side's demux
 await using var sub = await subscriber.SubscribeAsync(FullTrackName.FromStrings(["ns"], "video0"), ct);
 await foreach (var obj in sub.ReadObjectsAsync(ct)) { /* obj.Payload ... */ }
 ```

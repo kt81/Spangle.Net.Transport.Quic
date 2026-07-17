@@ -26,8 +26,12 @@ jobs:
       - name: Restore
         run: dotnet restore
 
+      # The version goes into the BUILD, not just the pack: pack runs with --no-build, so a
+      # version passed only there would stamp the package while the DLLs inside kept their
+      # build-time AssemblyVersion/InformationalVersion — a mismatch every debugger and
+      # Source Link consumer would meet.
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build --no-restore --configuration Release -p:Version=${GITHUB_REF_NAME} -p:ContinuousIntegrationBuild=true
 
       # A last gate before publishing. The in-memory backend covers the protocol on
       # every host; the real msquic backend runs here best-effort (SPANGLE_REQUIRE_QUIC

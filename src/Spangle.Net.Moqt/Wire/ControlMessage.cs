@@ -75,7 +75,12 @@ public static class ControlMessage
             await ReadExactlyAsync(stream, typeBytes.AsMemory(1), cancellationToken).ConfigureAwait(false);
         }
 
-        VarInt.TryRead(typeBytes, out ulong type, out _);
+        if (!VarInt.TryRead(typeBytes, out ulong type, out _))
+        {
+            // Unreachable while GetEncodedLength and TryRead agree on the length prefix; if
+            // they ever drift, a silent type of 0 must not be the way anyone finds out.
+            throw new MoqProtocolException("The control message's type varint could not be decoded.");
+        }
 
         var lengthBytes = new byte[sizeof(ushort)];
         await ReadExactlyAsync(stream, lengthBytes, cancellationToken).ConfigureAwait(false);

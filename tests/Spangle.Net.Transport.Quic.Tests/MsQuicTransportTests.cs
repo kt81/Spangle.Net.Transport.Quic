@@ -140,6 +140,61 @@ public class MsQuicTransportTests
     }
 
     [SkippableFact]
+    public async Task Loopback_StreamCreditIsEnforcedAndReturnedOnDispose()
+    {
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "stream credit is real flow control; only msquic enforces it");
+
+        // MAX_STREAMS credit only returns when a stream fully closes. Consumers that accept
+        // and quietly drop streams pin credit until the peer's OpenStreamAsync wedges — the
+        // failure mode behind the 'delivery stops after N streams' class of bug. This pins the
+        // mechanics: exhaust a 2-stream budget, watch the third open block, free one, watch it
+        // proceed.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        CancellationToken ct = cts.Token;
+        IQuicTransport transport = MsQuicTransport.Shared;
+
+        using X509Certificate2 certificate = CreateSelfSignedCertificate();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Moq],
+            ServerCertificate = certificate,
+            MaxConcurrentInboundStreams = 2,
+        }, ct);
+
+        ValueTask<IQuicConnection> acceptTask = server.AcceptConnectionAsync(ct);
+        await using IQuicConnection client = await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Moq],
+            TargetHost = "localhost",
+            AllowUntrustedCertificates = true,
+        }, ct);
+        await using IQuicConnection accepted = await acceptTask;
+
+        await using IQuicStream first = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        await first.WriteAsync(new byte[] { 1 }, completeWrites: true, ct);
+        await using IQuicStream second = await client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        await second.WriteAsync(new byte[] { 1 }, completeWrites: true, ct);
+
+        Task<IQuicStream> third = client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct).AsTask();
+        await Task.Delay(200, ct);
+        third.IsCompleted.Should().BeFalse("both credits are pinned by streams nobody has closed");
+
+        // Closing one accepted stream is what returns its credit.
+        IQuicStream inbound = await accepted.AcceptStreamAsync(ct);
+        var buffer = new byte[16];
+        while (await inbound.ReadAsync(buffer, ct) != 0)
+        {
+        }
+
+        await inbound.DisposeAsync();
+
+        await using IQuicStream released = await third.WaitAsync(ct);
+        released.Should().NotBeNull();
+    }
+
+    [SkippableFact]
     public async Task Listen_WithoutAServerCertificate_FailsFast()
     {
         Skip.IfNot(MsQuicTransport.Shared.IsSupported, "the check only exists on the msquic backend");
