@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Quic;
 using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
 
 namespace Spangle.Net.Transport.Quic.MsQuic;
 
@@ -14,6 +16,9 @@ namespace Spangle.Net.Transport.Quic.MsQuic;
 /// The real QUIC backend: <see cref="System.Net.Quic"/> over native msquic. Requires the
 /// platform to support QUIC (msquic present, and an IPv6 stack for the dual-mode sockets
 /// System.Net.Quic binds); <see cref="IsSupported"/> reports whether it will run here.
+/// Every transport-level failure is surfaced as <see cref="QuicTransportException"/> — the
+/// backend's own <see cref="QuicException"/> never escapes, so protocol code written against
+/// <see cref="IQuicTransport"/> sees one error contract on every backend.
 /// </summary>
 public sealed class MsQuicTransport : IQuicTransport
 {
@@ -29,6 +34,15 @@ public sealed class MsQuicTransport : IQuicTransport
     {
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfUnsupported();
+        if (options.ServerCertificate is null)
+        {
+            // Without a certificate the listener binds happily and then fails every handshake
+            // with an opaque TLS alert on the client. Failing here names the actual mistake.
+            throw new ArgumentException(
+                "QuicServerOptions.ServerCertificate is required for the msquic backend: without one, "
+                + "every handshake fails with an unexplained TLS alert on the client side.",
+                nameof(options));
+        }
 
         var protocols = new List<SslApplicationProtocol>(options.ApplicationProtocols);
         var listenerOptions = new QuicListenerOptions
@@ -37,8 +51,8 @@ public sealed class MsQuicTransport : IQuicTransport
             ApplicationProtocols = protocols,
             ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(new QuicServerConnectionOptions
             {
-                DefaultStreamErrorCode = 0,
-                DefaultCloseErrorCode = 0,
+                DefaultStreamErrorCode = options.DefaultStreamErrorCode,
+                DefaultCloseErrorCode = options.DefaultCloseErrorCode,
                 IdleTimeout = options.IdleTimeout,
                 MaxInboundUnidirectionalStreams = options.MaxConcurrentInboundStreams,
                 MaxInboundBidirectionalStreams = options.MaxConcurrentInboundStreams,
@@ -65,9 +79,9 @@ public sealed class MsQuicTransport : IQuicTransport
         var clientAuthentication = new SslClientAuthenticationOptions
         {
             ApplicationProtocols = new List<SslApplicationProtocol>(options.ApplicationProtocols),
-            TargetHost = options.TargetHost
-                ?? (options.RemoteEndPoint as IPEndPoint)?.Address.ToString()
-                ?? string.Empty,
+            // No fallback to the IP literal: RFC 6066 forbids IP addresses in SNI, and while
+            // many servers shrug, some refuse the handshake over it. No TargetHost, no SNI.
+            TargetHost = options.TargetHost ?? string.Empty,
         };
         if (options.AllowUntrustedCertificates)
         {
@@ -80,8 +94,8 @@ public sealed class MsQuicTransport : IQuicTransport
         var connectionOptions = new QuicClientConnectionOptions
         {
             RemoteEndPoint = options.RemoteEndPoint,
-            DefaultStreamErrorCode = 0,
-            DefaultCloseErrorCode = 0,
+            DefaultStreamErrorCode = options.DefaultStreamErrorCode,
+            DefaultCloseErrorCode = options.DefaultCloseErrorCode,
             IdleTimeout = options.IdleTimeout,
             KeepAliveInterval = options.KeepAliveInterval ?? Timeout.InfiniteTimeSpan,
             MaxInboundUnidirectionalStreams = options.MaxConcurrentInboundStreams,
@@ -89,9 +103,29 @@ public sealed class MsQuicTransport : IQuicTransport
             ClientAuthenticationOptions = clientAuthentication,
         };
 
-        QuicConnection connection = await QuicConnection.ConnectAsync(connectionOptions, cancellationToken)
-            .ConfigureAwait(false);
-        return new MsQuicConnection(connection);
+        try
+        {
+            QuicConnection connection = await QuicConnection.ConnectAsync(connectionOptions, cancellationToken)
+                .ConfigureAwait(false);
+            return new MsQuicConnection(connection);
+        }
+        catch (QuicException e)
+        {
+            throw new QuicTransportException(QuicTransportError.ConnectionRefused,
+                $"The dial to {options.RemoteEndPoint} failed: {e.Message}", e);
+        }
+        catch (SocketException e)
+        {
+            // An unreachable host surfaces from msquic as a raw SocketException (ICMP
+            // unreachable on loopback, for one), not a QuicException.
+            throw new QuicTransportException(QuicTransportError.ConnectionRefused,
+                $"The dial to {options.RemoteEndPoint} failed: {e.Message}", e);
+        }
+        catch (AuthenticationException e)
+        {
+            throw new QuicTransportException(QuicTransportError.ConnectionRefused,
+                $"The dial to {options.RemoteEndPoint} failed TLS authentication: {e.Message}", e);
+        }
     }
 
     private void ThrowIfUnsupported()
@@ -106,6 +140,23 @@ public sealed class MsQuicTransport : IQuicTransport
     }
 }
 
+/// <summary>Maps System.Net.Quic's exception onto the backend-independent contract.</summary>
+internal static class MsQuicErrors
+{
+    public static QuicTransportException Map(QuicException e) => e.QuicError switch
+    {
+        QuicError.ConnectionRefused or QuicError.ConnectionTimeout or QuicError.VersionNegotiationError
+            or QuicError.AlpnInUse =>
+            new QuicTransportException(QuicTransportError.ConnectionRefused, e.Message, e),
+        QuicError.StreamAborted =>
+            new QuicTransportException(QuicTransportError.StreamAborted, e.Message, e),
+        QuicError.OperationAborted =>
+            new QuicTransportException(QuicTransportError.OperationAborted, e.Message, e),
+        // ConnectionAborted, ConnectionIdle, and anything unforeseen: the connection is gone.
+        _ => new QuicTransportException(QuicTransportError.ConnectionAborted, e.Message, e),
+    };
+}
+
 internal sealed class MsQuicServer : IQuicServer
 {
     private readonly QuicListener _listener;
@@ -116,8 +167,27 @@ internal sealed class MsQuicServer : IQuicServer
 
     public async ValueTask<IQuicConnection> AcceptConnectionAsync(CancellationToken cancellationToken = default)
     {
-        QuicConnection connection = await _listener.AcceptConnectionAsync(cancellationToken).ConfigureAwait(false);
-        return new MsQuicConnection(connection);
+        while (true)
+        {
+            try
+            {
+                QuicConnection connection = await _listener.AcceptConnectionAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return new MsQuicConnection(connection);
+            }
+            catch (QuicException e) when (e.QuicError != QuicError.OperationAborted)
+            {
+                // One connection's failed handshake — a TLS probe, an ALPN mismatch, a port
+                // scanner's single packet — surfaces here in System.Net.Quic. It is that
+                // stranger's problem, not the listener's; the loop keeps accepting everyone
+                // else, per the IQuicServer contract.
+            }
+            catch (QuicException e)
+            {
+                // OperationAborted: the listener itself is going away underneath us.
+                throw new ObjectDisposedException(nameof(MsQuicServer), e.Message);
+            }
+        }
     }
 
     public ValueTask DisposeAsync() => _listener.DisposeAsync();
@@ -139,18 +209,42 @@ internal sealed class MsQuicConnection : IQuicConnection
         QuicStreamType type = direction == QuicStreamDirection.Bidirectional
             ? QuicStreamType.Bidirectional
             : QuicStreamType.Unidirectional;
-        QuicStream stream = await _connection.OpenOutboundStreamAsync(type, cancellationToken).ConfigureAwait(false);
-        return new MsQuicStream(stream);
+        try
+        {
+            QuicStream stream = await _connection.OpenOutboundStreamAsync(type, cancellationToken)
+                .ConfigureAwait(false);
+            return new MsQuicStream(stream);
+        }
+        catch (QuicException e)
+        {
+            throw MsQuicErrors.Map(e);
+        }
     }
 
     public async ValueTask<IQuicStream> AcceptStreamAsync(CancellationToken cancellationToken = default)
     {
-        QuicStream stream = await _connection.AcceptInboundStreamAsync(cancellationToken).ConfigureAwait(false);
-        return new MsQuicStream(stream);
+        try
+        {
+            QuicStream stream = await _connection.AcceptInboundStreamAsync(cancellationToken).ConfigureAwait(false);
+            return new MsQuicStream(stream);
+        }
+        catch (QuicException e)
+        {
+            throw MsQuicErrors.Map(e);
+        }
     }
 
-    public ValueTask CloseAsync(long errorCode, CancellationToken cancellationToken = default) =>
-        _connection.CloseAsync(errorCode, cancellationToken);
+    public async ValueTask CloseAsync(long errorCode, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _connection.CloseAsync(errorCode, cancellationToken).ConfigureAwait(false);
+        }
+        catch (QuicException e)
+        {
+            throw MsQuicErrors.Map(e);
+        }
+    }
 
     public ValueTask DisposeAsync() => _connection.DisposeAsync();
 }
@@ -171,12 +265,30 @@ internal sealed class MsQuicStream : IQuicStream
 
     public bool CanWrite => _stream.CanWrite;
 
-    public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
-        _stream.ReadAsync(buffer, cancellationToken);
+    public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+        catch (QuicException e)
+        {
+            throw MsQuicErrors.Map(e);
+        }
+    }
 
-    public ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, bool completeWrites = false,
-        CancellationToken cancellationToken = default) =>
-        _stream.WriteAsync(buffer, completeWrites, cancellationToken);
+    public async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, bool completeWrites = false,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _stream.WriteAsync(buffer, completeWrites, cancellationToken).ConfigureAwait(false);
+        }
+        catch (QuicException e)
+        {
+            throw MsQuicErrors.Map(e);
+        }
+    }
 
     public void CompleteWrites() => _stream.CompleteWrites();
 

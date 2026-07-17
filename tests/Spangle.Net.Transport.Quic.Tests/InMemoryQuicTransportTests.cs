@@ -79,7 +79,8 @@ public class InMemoryQuicTransportTests
         var transport = new InMemoryQuicTransport();
         Func<Task> act = async () => await transport.ConnectAsync(
             ClientOptions(new IPEndPoint(IPAddress.Loopback, 51234)), cts.Token);
-        await act.Should().ThrowAsync<InvalidOperationException>();
+        (await act.Should().ThrowAsync<QuicTransportException>())
+            .Which.Error.Should().Be(QuicTransportError.ConnectionRefused);
     }
 
     [Fact]
@@ -96,7 +97,8 @@ public class InMemoryQuicTransportTests
             ApplicationProtocols = [new SslApplicationProtocol("something-else")],
         };
         Func<Task> act = async () => await transport.ConnectAsync(clientOptions, ct);
-        await act.Should().ThrowAsync<InvalidOperationException>();
+        (await act.Should().ThrowAsync<QuicTransportException>())
+            .Which.Error.Should().Be(QuicTransportError.ConnectionRefused);
     }
 
     [Fact]

@@ -21,7 +21,11 @@ public interface IQuicTransport
     /// <summary>Starts accepting inbound QUIC connections.</summary>
     ValueTask<IQuicServer> ListenAsync(QuicServerOptions options, CancellationToken cancellationToken = default);
 
-    /// <summary>Dials an outbound QUIC connection.</summary>
+    /// <summary>
+    /// Dials an outbound QUIC connection. A failed dial — nothing listening, unreachable, TLS
+    /// or ALPN refused — throws <see cref="QuicTransportException"/> with
+    /// <see cref="QuicTransportError.ConnectionRefused"/>, whichever backend is underneath.
+    /// </summary>
     ValueTask<IQuicConnection> ConnectAsync(QuicClientOptions options, CancellationToken cancellationToken = default);
 }
 
@@ -31,7 +35,14 @@ public interface IQuicServer : IAsyncDisposable
     /// <summary>The address the server is bound to (with the concrete port once bound).</summary>
     EndPoint LocalEndPoint { get; }
 
-    /// <summary>Awaits the next fully established inbound connection.</summary>
+    /// <summary>
+    /// Awaits the next fully established inbound connection. One connection failing its
+    /// handshake — a TLS probe, an ALPN mismatch, a port scanner — is consumed internally and
+    /// never surfaces here: a bare <c>while (true) Accept</c> loop is the intended caller, and
+    /// one stranger's failure must not kill the loop that accepts everyone else. This throws
+    /// only when accepting itself can no longer work: <see cref="ObjectDisposedException"/>
+    /// once the server is disposed, <see cref="OperationCanceledException"/> on cancellation.
+    /// </summary>
     ValueTask<IQuicConnection> AcceptConnectionAsync(CancellationToken cancellationToken = default);
 }
 
@@ -123,6 +134,15 @@ public sealed record QuicServerOptions
     /// a control stream plus a data stream per subgroup, so the default is generous.
     /// </summary>
     public int MaxConcurrentInboundStreams { get; init; } = 128;
+
+    /// <summary>
+    /// The application error code stamped on streams that are aborted implicitly — disposed
+    /// without a graceful close. MOQT has an error-code registry; 0 reads as "no error".
+    /// </summary>
+    public long DefaultStreamErrorCode { get; init; }
+
+    /// <summary>The application error code used when the connection is closed implicitly.</summary>
+    public long DefaultCloseErrorCode { get; init; }
 }
 
 /// <summary>Everything a backend needs to dial a peer.</summary>
@@ -161,4 +181,13 @@ public sealed record QuicClientOptions
     /// which makes AcceptStreamAsync fail, so both directions are granted this credit.
     /// </summary>
     public int MaxConcurrentInboundStreams { get; init; } = 128;
+
+    /// <summary>
+    /// The application error code stamped on streams that are aborted implicitly — disposed
+    /// without a graceful close. MOQT has an error-code registry; 0 reads as "no error".
+    /// </summary>
+    public long DefaultStreamErrorCode { get; init; }
+
+    /// <summary>The application error code used when the connection is closed implicitly.</summary>
+    public long DefaultCloseErrorCode { get; init; }
 }

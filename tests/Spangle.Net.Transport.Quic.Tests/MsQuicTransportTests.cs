@@ -139,6 +139,53 @@ public class MsQuicTransportTests
         received.Should().Equal(payload);
     }
 
+    [SkippableFact]
+    public async Task Listen_WithoutAServerCertificate_FailsFast()
+    {
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "the check only exists on the msquic backend");
+
+        // Without this check the listener binds happily and every handshake then fails with
+        // an unexplained 'UserCanceled' TLS alert on the client — the mistake deserves its
+        // name at the point it is made.
+        Func<Task> act = async () => await MsQuicTransport.Shared.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Moq],
+        });
+        (await act.Should().ThrowAsync<ArgumentException>()).WithMessage("*ServerCertificate*");
+    }
+
+    [SkippableFact]
+    public async Task Connect_WithDefaultValidation_RejectsASelfSignedServer()
+    {
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "needs the real TLS handshake");
+
+        // Certificate validation must be on unless explicitly opted out — every other test
+        // sets AllowUntrustedCertificates, so without this one, the `if` around the
+        // accept-anything callback could vanish and the whole suite would stay green.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        CancellationToken ct = cts.Token;
+        IQuicTransport transport = MsQuicTransport.Shared;
+
+        using X509Certificate2 certificate = CreateSelfSignedCertificate();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Moq],
+            ServerCertificate = certificate,
+        }, ct);
+
+        Func<Task> act = async () => await transport.ConnectAsync(new QuicClientOptions
+        {
+            RemoteEndPoint = server.LocalEndPoint,
+            ApplicationProtocols = [Moq],
+            TargetHost = "localhost",
+            // AllowUntrustedCertificates deliberately left at its default: false
+        }, ct);
+        (await act.Should().ThrowAsync<QuicTransportException>())
+            .Which.Error.Should().Be(QuicTransportError.ConnectionRefused);
+    }
+
     private static X509Certificate2 CreateSelfSignedCertificate()
     {
         using var rsa = RSA.Create(2048);
