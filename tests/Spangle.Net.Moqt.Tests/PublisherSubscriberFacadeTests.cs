@@ -4,6 +4,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Spangle.Net.Moqt.Data;
 using Spangle.Net.Moqt.Messages;
+using Spangle.Net.Moqt.Wire;
 using Spangle.Net.Transport.Quic;
 using Spangle.Net.Transport.Quic.InMemory;
 using Spangle.Net.Transport.Quic.MsQuic;
@@ -79,8 +80,8 @@ public class PublisherSubscriberFacadeTests
         (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
         FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
 
-        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
-        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
         await using MoqSession pubSession = await pubSessionTask;
 
         MoqPublisher publisher = MoqPublisher.Create(pubSession);
@@ -88,9 +89,11 @@ public class PublisherSubscriberFacadeTests
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = publisher.RunAsync(runCts.Token);
 
-        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
-        await using MoqSubscription subscription = await subscriber.SubscribeAsync(track, ct);
-        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, subscription.TrackAlias, ct);
+        // Subscribed by hand: the raw subgroup header is the object of this test, and the
+        // session demux would claim the stream before the test could read it off the wire.
+        (ulong alias, IQuicStream subscribeRequest) = await SubscribeByHandAsync(subSession, track, ct);
+        await using IQuicStream request = subscribeRequest;
+        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, alias, ct);
 
         await using (MoqGroupWriter group = await published.BeginGroupAsync(7, publisherPriority: 100,
             endOfGroup: true, subgroupId: 3, cancellationToken: ct))
@@ -136,8 +139,8 @@ public class PublisherSubscriberFacadeTests
         (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
         FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
 
-        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
-        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
         await using MoqSession pubSession = await pubSessionTask;
 
         MoqPublisher publisher = MoqPublisher.Create(pubSession);
@@ -145,15 +148,18 @@ public class PublisherSubscriberFacadeTests
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = publisher.RunAsync(runCts.Token);
 
-        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
-        await using MoqSubscription first = await subscriber.SubscribeAsync(track, ct);
-        ulong firstAlias = await published.WaitForSubscriberAsync().WaitAsync(ct);
+        // Subscribed by hand: this test inspects the raw subgroup wire, which the session
+        // demux would otherwise claim.
+        (ulong firstAlias, IQuicStream firstRequest) = await SubscribeByHandAsync(subSession, track, ct);
+        await using IQuicStream request1 = firstRequest;
+        (await published.WaitForSubscriberAsync().WaitAsync(ct)).Should().Be(firstAlias);
 
         // The same peer subscribes again, as a relay does when a new viewer arrives.
-        await using MoqSubscription second = await subscriber.SubscribeAsync(track, ct);
-        second.TrackAlias.Should().NotBe(firstAlias, "each subscription gets its own alias");
+        (ulong secondAlias, IQuicStream secondRequest) = await SubscribeByHandAsync(subSession, track, ct);
+        await using IQuicStream request2 = secondRequest;
+        secondAlias.Should().NotBe(firstAlias, "each subscription gets its own alias");
 
-        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, second.TrackAlias, ct);
+        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, secondAlias, ct);
         await using (MoqGroupWriter group = await published.BeginGroupAsync(0, publisherPriority: 100,
             cancellationToken: ct))
         {
@@ -162,8 +168,8 @@ public class PublisherSubscriberFacadeTests
         }
 
         SubgroupHeader header = await headerTask;
-        header.TrackAlias.Should().Be(second.TrackAlias, "objects go where the newest subscription says");
-        published.CurrentAlias.Should().Be(second.TrackAlias);
+        header.TrackAlias.Should().Be(secondAlias, "objects go where the newest subscription says");
+        published.CurrentAlias.Should().Be(secondAlias);
 
         await runCts.CancelAsync();
         try
@@ -197,8 +203,8 @@ public class PublisherSubscriberFacadeTests
 
         (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
 
-        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
-        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
         MoqSession pubSession = await pubSessionTask;
 
         MoqPublisher publisher = MoqPublisher.Create(pubSession);
@@ -224,6 +230,155 @@ public class PublisherSubscriberFacadeTests
         MoqPublishedTrack late = publisher.PublishTrack(FullTrackName.FromStrings(["live"], "audio0"));
         Func<Task> lateWait = async () => await late.BeginGroupAsync(0, publisherPriority: 100, cancellationToken: ct);
         await lateWait.Should().ThrowAsync<Exception>();
+    }
+
+    /// <summary>
+    /// Two concurrent subscriptions on one session, each receiving its own track — the reason
+    /// the session owns a single demux loop. Under the previous design every subscription ran
+    /// its own accept loop and they raced each other for streams: whichever accepted first
+    /// disposed the other's data.
+    /// </summary>
+    [Fact]
+    public async Task TwoSubscriptions_OnOneSession_EachReceiveTheirOwnTrack()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+        FullTrackName video = FullTrackName.FromStrings(["live"], "video0");
+        FullTrackName audio = FullTrackName.FromStrings(["live"], "audio0");
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack videoTrack = publisher.PublishTrack(video);
+        MoqPublishedTrack audioTrack = publisher.PublishTrack(audio);
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+        Task subRun = subSession.RunAsync(runCts.Token);
+
+        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
+        await using MoqSubscription videoSub = await subscriber.SubscribeAsync(video, ct);
+        await using MoqSubscription audioSub = await subscriber.SubscribeAsync(audio, ct);
+
+        await using (MoqGroupWriter g = await videoTrack.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct))
+        {
+            await g.WriteObjectAsync(0, Encoding.UTF8.GetBytes("v"), cancellationToken: ct);
+            await g.CompleteAsync(ct);
+        }
+
+        await using (MoqGroupWriter g = await audioTrack.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct))
+        {
+            await g.WriteObjectAsync(0, Encoding.UTF8.GetBytes("a"), cancellationToken: ct);
+            await g.CompleteAsync(ct);
+        }
+
+        MoqObject videoObject = await FirstObjectAsync(videoSub, ct);
+        MoqObject audioObject = await FirstObjectAsync(audioSub, ct);
+        Encoding.UTF8.GetString(videoObject.Payload.Span).Should().Be("v");
+        Encoding.UTF8.GetString(audioObject.Payload.Span).Should().Be("a");
+
+        await runCts.CancelAsync();
+        foreach (Task loop in new[] { run, subRun })
+        {
+            try
+            {
+                await loop;
+            }
+            catch (OperationCanceledException)
+            {
+                // the demux loops are cancelled once the flow is verified
+            }
+        }
+    }
+
+    /// <summary>
+    /// An unknown track is answered with REQUEST_ERROR — the code moxygen uses for "no such
+    /// namespace or track" — not a bare reset, which reads as a transient failure and invites
+    /// the peer to retry forever.
+    /// </summary>
+    [Fact]
+    public async Task SubscribeForAnUnknownTrack_IsAnsweredWithRequestError()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession); // declares no tracks at all
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+
+        await using IQuicStream request = await subSession.OpenRequestStreamAsync(ct);
+        var payload = new System.Buffers.ArrayBufferWriter<byte>();
+        new SubscribeMessage(0, FullTrackName.FromStrings(["live"], "nope")).EncodePayload(new MoqWriter(payload));
+        var frame = new System.Buffers.ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.Subscribe, payload.WrittenSpan);
+        await request.WriteAsync(frame.WrittenMemory, completeWrites: false, ct);
+
+        (ulong type, byte[] replyPayload) = await ControlMessage.ReadAsync(request, ct);
+        type.Should().Be(MoqControlMessageType.RequestError);
+        RequestErrorMessage error = RequestErrorMessage.DecodePayload(replyPayload);
+        error.ErrorCode.Should().Be(0x10UL, "0x10 is what moxygen answers for a track it does not know");
+
+        await runCts.CancelAsync();
+        try
+        {
+            await run;
+        }
+        catch (OperationCanceledException)
+        {
+            // the demux loop is cancelled once the reply is verified
+        }
+    }
+
+    private static async Task<MoqObject> FirstObjectAsync(MoqSubscription subscription, CancellationToken ct)
+    {
+        await foreach (MoqObject moqObject in subscription.ReadObjectsAsync(ct))
+        {
+            return moqObject;
+        }
+
+        throw new InvalidOperationException("the subscription ended before an object arrived");
+    }
+
+    /// <summary>
+    /// SUBSCRIBEs outside the facade, so a test can keep the raw wire to itself: with the
+    /// session demux running, the subgroup streams would be claimed before the test saw them.
+    /// </summary>
+    private static async Task<(ulong Alias, IQuicStream Request)> SubscribeByHandAsync(MoqSession session,
+        FullTrackName track, CancellationToken ct)
+    {
+        IQuicStream request = await session.OpenRequestStreamAsync(ct);
+        var payload = new System.Buffers.ArrayBufferWriter<byte>();
+        new SubscribeMessage(0, track).EncodePayload(new MoqWriter(payload));
+        var frame = new System.Buffers.ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.Subscribe, payload.WrittenSpan);
+        await request.WriteAsync(frame.WrittenMemory, completeWrites: false, ct);
+
+        (ulong type, byte[] okPayload) = await ControlMessage.ReadAsync(request, ct);
+        type.Should().Be(MoqControlMessageType.SubscribeOk);
+        return (SubscribeOkMessage.DecodePayload(okPayload).TrackAlias, request);
     }
 
     private static async Task<SubgroupHeader> FirstSubgroupHeaderAsync(IQuicConnection connection, ulong alias,
@@ -262,14 +417,16 @@ public class PublisherSubscriberFacadeTests
 
         // SETUP is a concurrent handshake: the acceptor waits for the connector's control stream,
         // so both sides must be established at once.
-        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), ct);
-        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), ct);
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
         await using MoqSession pubSession = await pubSessionTask;
 
         MoqPublisher publisher = MoqPublisher.Create(pubSession);
         MoqPublishedTrack published = publisher.PublishTrack(track);
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = publisher.RunAsync(runCts.Token);
+        // The subscriber side needs its own demux loop: subgroup streams only arrive through it.
+        Task subRun = subSession.RunAsync(runCts.Token);
 
         MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
         Task<IReadOnlyList<(ulong Group, ulong Id, string Text)>> subscriberSide =
@@ -298,13 +455,16 @@ public class PublisherSubscriberFacadeTests
             (1UL, 0UL, "g1o0"));
 
         await runCts.CancelAsync();
-        try
+        foreach (Task loop in new[] { run, subRun })
         {
-            await run;
-        }
-        catch (OperationCanceledException)
-        {
-            // the demux loop is cancelled once the flow is verified
+            try
+            {
+                await loop;
+            }
+            catch (OperationCanceledException)
+            {
+                // the demux loops are cancelled once the flow is verified
+            }
         }
     }
 

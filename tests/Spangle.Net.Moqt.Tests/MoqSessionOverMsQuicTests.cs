@@ -54,8 +54,8 @@ public class MoqSessionOverMsQuicTests
         var serverSetup = new SetupMessage(
             [MoqKeyValuePair.FromBytes(MoqSetupOption.MoqtImplementation, Encoding.UTF8.GetBytes("spangle"))]);
 
-        Task<MoqSession> serverSessionTask = MoqSession.AcceptAsync(serverConn, serverSetup, ct);
-        await using MoqSession clientSession = await MoqSession.ConnectAsync(clientConn, clientSetup, ct);
+        Task<MoqSession> serverSessionTask = MoqSession.AcceptAsync(serverConn, serverSetup, cancellationToken: ct);
+        await using MoqSession clientSession = await MoqSession.ConnectAsync(clientConn, clientSetup, cancellationToken: ct);
         await using MoqSession serverSession = await serverSessionTask;
 
         Encoding.UTF8.GetString(clientSession.RemoteSetup.Options.Single(

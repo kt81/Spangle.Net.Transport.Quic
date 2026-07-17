@@ -40,9 +40,36 @@ public static class ControlMessage
         var firstByte = new byte[1];
         await ReadExactlyAsync(stream, firstByte, cancellationToken).ConfigureAwait(false);
 
-        int typeLength = VarInt.GetEncodedLength(firstByte[0]);
+        return await ReadAfterFirstByteAsync(stream, firstByte[0], cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads one framed control message, or null when the stream ends cleanly before one
+    /// begins — the case a control-stream pump must tell apart from truncation, because a
+    /// clean close is a deliberate act of the peer (and §3.3 makes it a session error), while
+    /// ending mid-message still throws <see cref="MoqProtocolException"/>.
+    /// </summary>
+    public static async ValueTask<(ulong Type, byte[] Payload)?> TryReadAsync(IQuicStream stream,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        var firstByte = new byte[1];
+        int read = await stream.ReadAsync(firstByte, cancellationToken).ConfigureAwait(false);
+        if (read == 0)
+        {
+            return null;
+        }
+
+        return await ReadAfterFirstByteAsync(stream, firstByte[0], cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async ValueTask<(ulong Type, byte[] Payload)> ReadAfterFirstByteAsync(IQuicStream stream,
+        byte firstByte, CancellationToken cancellationToken)
+    {
+        int typeLength = VarInt.GetEncodedLength(firstByte);
         var typeBytes = new byte[typeLength];
-        typeBytes[0] = firstByte[0];
+        typeBytes[0] = firstByte;
         if (typeLength > 1)
         {
             await ReadExactlyAsync(stream, typeBytes.AsMemory(1), cancellationToken).ConfigureAwait(false);

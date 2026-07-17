@@ -51,8 +51,9 @@ public sealed class MoqPublisher
     public async Task AnnounceNamespaceAsync(TrackNamespace @namespace, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(@namespace);
-        ulong requestId = _nextRequestId;
-        _nextRequestId += 2;
+        // Announces may come from any thread, unlike subscriptions (which the session's
+        // dispatch loop serializes), so the id step is atomic.
+        ulong requestId = Interlocked.Add(ref _nextRequestId, 2) - 2;
 
         IQuicStream request = await _session.Connection
             .OpenStreamAsync(QuicStreamDirection.Bidirectional, cancellationToken).ConfigureAwait(false);
@@ -90,11 +91,17 @@ public sealed class MoqPublisher
         return track;
     }
 
+    // What moxygen answers a SUBSCRIBE for a track it does not know: REQUEST_ERROR code 0x10,
+    // "no such namespace or track".
+    private const ulong DoesNotExistErrorCode = 0x10;
+
     /// <summary>
-    /// Runs the request-stream demux loop until cancellation: every SUBSCRIBE that matches a
-    /// declared track is answered with SUBSCRIBE_OK carrying a newly assigned Track Alias, after
-    /// which the track streams its objects to that subscriber. A SUBSCRIBE for an unknown track
-    /// is rejected by resetting the request stream (no SUBSCRIBE_ERROR yet).
+    /// Registers this publisher as the session's request handler and runs the session's demux
+    /// loop until cancellation: every SUBSCRIBE that matches a declared track is answered with
+    /// SUBSCRIBE_OK carrying a newly assigned Track Alias, after which the track streams its
+    /// objects to that subscriber. A SUBSCRIBE for an unknown track is answered with
+    /// REQUEST_ERROR ("does not exist") — a reset alone reads as a transient failure and
+    /// invites the peer to retry forever.
     /// <para>
     /// When this loop stops — cancelled, or because the session died under it — every track's wait
     /// for a subscriber stops with it. Nothing else would notice: a publisher whose connection has
@@ -105,42 +112,10 @@ public sealed class MoqPublisher
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
+        _session.OnRequest(HandleRequestAsync);
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                MoqIncomingStream incoming;
-                try
-                {
-                    incoming = await MoqStreamRouter.AcceptAsync(_session.Connection, limits: null, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-
-                if (incoming is not MoqRequestStream request || request.MessageType != MoqControlMessageType.Subscribe)
-                {
-                    // This cut only handles SUBSCRIBE request streams — but the stream was
-                    // accepted, and an accepted stream holds inbound-stream credit until it is
-                    // closed. Kept undisposed, enough of them wedge the peer's OpenStreamAsync.
-                    await incoming.Stream.DisposeAsync().ConfigureAwait(false);
-                    continue;
-                }
-
-                SubscribeMessage subscribe = SubscribeMessage.DecodePayload(request.Payload.Span);
-                if (!_tracks.TryGetValue(Key(subscribe.Track), out MoqPublishedTrack? track))
-                {
-                    request.Stream.Abort(0); // unknown track; no SUBSCRIBE_ERROR in this cut
-                    await request.Stream.DisposeAsync().ConfigureAwait(false);
-                    continue;
-                }
-
-                ulong alias = _nextAlias++;
-                await WriteSubscribeOkAsync(request.Stream, alias, cancellationToken).ConfigureAwait(false);
-                track.AttachSubscriber(alias);
-            }
+            await _session.RunAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -151,6 +126,42 @@ public sealed class MoqPublisher
         }
 
         Stop(new MoqProtocolException("The publisher stopped serving subscriptions."));
+    }
+
+    // Runs on the session's dispatch loop, one request at a time — the track table and the
+    // alias counter need no locking because of that.
+    private async Task HandleRequestAsync(MoqRequestStream request, CancellationToken cancellationToken)
+    {
+        if (request.MessageType != MoqControlMessageType.Subscribe)
+        {
+            // This cut only handles SUBSCRIBE request streams — but the stream was accepted,
+            // and an accepted stream holds inbound-stream credit until it is closed.
+            await request.Stream.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        SubscribeMessage subscribe = SubscribeMessage.DecodePayload(request.Payload.Span);
+        if (!_tracks.TryGetValue(Key(subscribe.Track), out MoqPublishedTrack? track))
+        {
+            await WriteRequestErrorAsync(request.Stream, cancellationToken).ConfigureAwait(false);
+            await request.Stream.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        ulong alias = _nextAlias++;
+        await WriteSubscribeOkAsync(request.Stream, alias, cancellationToken).ConfigureAwait(false);
+        track.AttachSubscriber(alias);
+    }
+
+    private static async Task WriteRequestErrorAsync(IQuicStream requestStream, CancellationToken cancellationToken)
+    {
+        var payload = new ArrayBufferWriter<byte>();
+        new RequestErrorMessage(DoesNotExistErrorCode, retryInterval: 0, "no such namespace or track")
+            .EncodePayload(new MoqWriter(payload));
+        var frame = new ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.RequestError, payload.WrittenSpan);
+        await requestStream.WriteAsync(frame.WrittenMemory, completeWrites: true, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     // The publisher answers no more subscriptions, so nothing is coming for the tracks that are

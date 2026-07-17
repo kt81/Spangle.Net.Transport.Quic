@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using Spangle.Net.Moqt.Messages;
 using Spangle.Net.Moqt.Wire;
 using Spangle.Net.Transport.Quic;
@@ -11,11 +12,12 @@ namespace Spangle.Net.Moqt;
 /// The subscriber side of a MOQT session, built on an established <see cref="MoqSession"/>: send
 /// SUBSCRIBE for a track and receive its objects as they arrive on subgroup streams. This is the
 /// native (non-browser, raw-QUIC) counterpart of a browser player — the verifier the Spangle
-/// egress is driven against before an external relay is involved, and the entry point for a
-/// future MoQ ingest path.
+/// egress is driven against before an external relay is involved, and the entry point for the
+/// MoQ ingest path.
 /// <para>
-/// Scope (first cut): one SUBSCRIBE at a time, matched to its Track Alias; no SUBSCRIBE_UPDATE,
-/// FETCH, or multi-track demux. The session owns the connection lifetime.
+/// The session's demux loop (<see cref="MoqSession.RunAsync"/>) must be running: it is what
+/// accepts the subgroup streams and routes them to each subscription by Track Alias. Any number
+/// of concurrent subscriptions can share the session; each reads only its own streams.
 /// </para>
 /// </summary>
 public sealed class MoqSubscriber
@@ -42,7 +44,7 @@ public sealed class MoqSubscriber
     /// <summary>
     /// Sends SUBSCRIBE for <paramref name="track"/> on a new request stream and awaits SUBSCRIBE_OK,
     /// returning a subscription bound to the assigned Track Alias. Read its objects with
-    /// <see cref="MoqSubscription.ReadObjectsAsync"/>.
+    /// <see cref="MoqSubscription.ReadObjectsAsync"/>. The session's demux loop must be running.
     /// </summary>
     [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
         Justification = "The request stream is owned by the returned MoqSubscription and disposed there.")]
@@ -54,8 +56,9 @@ public sealed class MoqSubscriber
         IQuicStream request = await _session.Connection
             .OpenStreamAsync(QuicStreamDirection.Bidirectional, cancellationToken).ConfigureAwait(false);
 
-        ulong requestId = _nextRequestId;
-        _nextRequestId += 2;
+        // Subscribes may come from any thread — concurrent subscriptions are the point of the
+        // session demux — so the id step is atomic.
+        ulong requestId = Interlocked.Add(ref _nextRequestId, 2) - 2;
 
         // Mandatory SUBSCRIPTION_FILTER, set to Largest Object (subscribe from the live edge).
         var filterValue = new ArrayBufferWriter<byte>();
@@ -74,75 +77,69 @@ public sealed class MoqSubscriber
         if (type != MoqControlMessageType.SubscribeOk)
         {
             request.Abort(0);
+            await request.DisposeAsync().ConfigureAwait(false);
             throw new MoqProtocolException(
                 $"Expected SUBSCRIBE_OK (0x{MoqControlMessageType.SubscribeOk:X}) after SUBSCRIBE, got 0x{type:X}.");
         }
 
         SubscribeOkMessage ok = SubscribeOkMessage.DecodePayload(okPayload);
-        return new MoqSubscription(_session.Connection, request, ok.TrackAlias);
+        return new MoqSubscription(_session, request, ok.TrackAlias);
     }
 }
 
 /// <summary>
 /// An accepted subscription: its Track Alias plus the object stream. Objects are delivered on
-/// unidirectional subgroup streams the publisher opens; this type accepts them, filters by alias,
-/// and yields each object in arrival order.
+/// unidirectional subgroup streams the publisher opens; the session's demux loop routes the ones
+/// carrying this subscription's alias here, and <see cref="ReadObjectsAsync"/> yields each object
+/// in arrival order.
 /// </summary>
 public sealed class MoqSubscription : IAsyncDisposable
 {
-    private readonly IQuicConnection _connection;
+    private readonly MoqSession _session;
     private readonly IQuicStream _request;
+    private readonly ChannelReader<MoqSubgroupStream> _subgroups;
 
-    internal MoqSubscription(IQuicConnection connection, IQuicStream request, ulong trackAlias)
+    internal MoqSubscription(MoqSession session, IQuicStream request, ulong trackAlias)
     {
-        _connection = connection;
+        _session = session;
         _request = request;
         TrackAlias = trackAlias;
+        _subgroups = session.ClaimSubgroups(trackAlias);
     }
 
     /// <summary>The Track Alias the publisher assigned; subgroup streams carrying it belong here.</summary>
     public ulong TrackAlias { get; }
 
     /// <summary>
-    /// Yields the track's objects as they arrive, group after group, until cancellation. Streams
-    /// carrying a different alias are skipped. The enumerator does not end on its own (a live track
-    /// has no end); the caller stops by breaking the enumeration or cancelling the token.
+    /// Yields the track's objects as they arrive, group after group. The enumeration ends when
+    /// the session's demux loop ends (the session died or was cancelled) — a live track has no
+    /// end of its own — or when the caller breaks out or cancels the token.
     /// </summary>
     public async IAsyncEnumerable<MoqObject> ReadObjectsAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        await foreach (MoqSubgroupStream subgroup in _subgroups.ReadAllAsync(cancellationToken)
+                           .ConfigureAwait(false))
         {
-            MoqIncomingStream incoming;
             try
             {
-                incoming = await MoqStreamRouter.AcceptAsync(_connection, limits: null, cancellationToken)
-                    .ConfigureAwait(false);
+                while (await subgroup.Reader.ReadObjectAsync(cancellationToken).ConfigureAwait(false) is
+                       { } moqObject)
+                {
+                    yield return moqObject;
+                }
             }
-            catch (OperationCanceledException)
+            finally
             {
-                yield break;
+                await subgroup.Stream.DisposeAsync().ConfigureAwait(false);
             }
-
-            if (incoming is not MoqSubgroupStream subgroup || subgroup.Reader.Header.TrackAlias != TrackAlias)
-            {
-                // Control/request streams and other tracks are not ours — but the stream was
-                // accepted, and an accepted stream holds inbound-stream credit until it is
-                // closed. Kept undisposed, enough of them wedge the peer's OpenStreamAsync.
-                // (This facade is one subscription per connection, so no one else wants it.)
-                await incoming.Stream.DisposeAsync().ConfigureAwait(false);
-                continue;
-            }
-
-            while (await subgroup.Reader.ReadObjectAsync(cancellationToken).ConfigureAwait(false) is { } moqObject)
-            {
-                yield return moqObject;
-            }
-
-            await subgroup.Stream.DisposeAsync().ConfigureAwait(false);
         }
     }
 
     /// <inheritdoc />
-    public ValueTask DisposeAsync() => _request.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        await _session.ReleaseSubgroupsAsync(TrackAlias).ConfigureAwait(false);
+        await _request.DisposeAsync().ConfigureAwait(false);
+    }
 }

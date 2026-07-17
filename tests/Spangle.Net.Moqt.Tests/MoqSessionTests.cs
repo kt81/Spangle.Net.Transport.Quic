@@ -50,8 +50,8 @@ public class MoqSessionTests
             [MoqKeyValuePair.FromBytes(MoqSetupOption.MoqtImplementation, Encoding.UTF8.GetBytes("spangle"))]);
 
         // server reads then answers; client opens+sends then reads — run concurrently
-        Task<MoqSession> serverSessionTask = MoqSession.AcceptAsync(serverConn, serverSetup, ct);
-        await using MoqSession clientSession = await MoqSession.ConnectAsync(clientConn, clientSetup, ct);
+        Task<MoqSession> serverSessionTask = MoqSession.AcceptAsync(serverConn, serverSetup, cancellationToken: ct);
+        await using MoqSession clientSession = await MoqSession.ConnectAsync(clientConn, clientSetup, cancellationToken: ct);
         await using MoqSession serverSession = await serverSessionTask;
 
         serverSession.IsServer.Should().BeTrue();
@@ -109,5 +109,110 @@ public class MoqSessionTests
         {
             throw new MoqProtocolException($"Expected SETUP, got 0x{type:X}.");
         }
+    }
+
+    /// <summary>
+    /// GOAWAY arrives on the control stream and surfaces through
+    /// <see cref="MoqSession.GoAwayReceived"/> without ending the session: the peer is asking
+    /// us to drain and move, not hanging up. Before the control pump existed, nothing read the
+    /// control stream after SETUP and a GOAWAY vanished unobserved.
+    /// </summary>
+    [Fact]
+    public async Task GoAway_FromThePeer_SurfacesWithoutEndingTheSession()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        (IQuicConnection clientConn, IQuicConnection serverConn) = await ConnectPairAsync(transport, server, ct);
+
+        Task<(IQuicStream Inbound, IQuicStream Outbound)> serverSide = HandshakeByHandAsync(serverConn, ct);
+        await using MoqSession session =
+            await MoqSession.ConnectAsync(clientConn, new SetupMessage(), cancellationToken: ct);
+        (IQuicStream serverIn, IQuicStream serverOut) = await serverSide;
+        await using IQuicStream inbound = serverIn;
+        await using IQuicStream outbound = serverOut;
+
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = session.RunAsync(runCts.Token);
+
+        var payload = new System.Buffers.ArrayBufferWriter<byte>();
+        new GoAwayMessage("https://relay.example/next", timeout: 30).EncodePayload(new MoqWriter(payload));
+        var frame = new System.Buffers.ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.GoAway, payload.WrittenSpan);
+        await outbound.WriteAsync(frame.WrittenMemory, completeWrites: false, ct);
+
+        GoAwayMessage goAway = await session.GoAwayReceived.WaitAsync(ct);
+        goAway.NewSessionUri.Should().Be("https://relay.example/next");
+        goAway.Timeout.Should().Be(30UL);
+        run.IsCompleted.Should().BeFalse("GOAWAY announces migration; the session drains rather than dying");
+
+        await runCts.CancelAsync();
+        try
+        {
+            await run;
+        }
+        catch (OperationCanceledException)
+        {
+            // cancelled once the GOAWAY is verified
+        }
+    }
+
+    /// <summary>
+    /// The peer closing its control stream ends the session run with a protocol error — §3.3
+    /// makes the control stream coterminous with the session, so its clean end is not clean at
+    /// all, and a consumer awaiting <see cref="MoqSession.RunAsync"/> is the one who learns.
+    /// </summary>
+    [Fact]
+    public async Task PeerClosingItsControlStream_EndsTheSessionRun()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+        (IQuicConnection clientConn, IQuicConnection serverConn) = await ConnectPairAsync(transport, server, ct);
+
+        Task<(IQuicStream Inbound, IQuicStream Outbound)> serverSide = HandshakeByHandAsync(serverConn, ct);
+        await using MoqSession session =
+            await MoqSession.ConnectAsync(clientConn, new SetupMessage(), cancellationToken: ct);
+        (IQuicStream serverIn, IQuicStream serverOut) = await serverSide;
+        await using IQuicStream inbound = serverIn;
+
+        Task run = session.RunAsync(ct);
+        await serverOut.DisposeAsync(); // FIN the control stream mid-session
+
+        // `run` is this test's own task; awaiting it is not the foreign-task hazard VSTHRD003 warns of.
+#pragma warning disable VSTHRD003
+        Func<Task> act = async () => await run;
+#pragma warning restore VSTHRD003
+        (await act.Should().ThrowAsync<MoqProtocolException>()).WithMessage("*control stream*");
+    }
+
+    // The server side of the SETUP handshake by hand, so a test can then drive the control
+    // stream itself: accept the client's control stream, read its SETUP, open ours, answer.
+    private static async Task<(IQuicStream Inbound, IQuicStream Outbound)> HandshakeByHandAsync(
+        IQuicConnection serverConn, CancellationToken ct)
+    {
+        IQuicStream inbound = await serverConn.AcceptStreamAsync(ct);
+        (ulong type, _) = await ControlMessage.ReadAsync(inbound, ct);
+        type.Should().Be(MoqControlMessageType.Setup);
+
+        IQuicStream outbound = await serverConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
+        var payload = new System.Buffers.ArrayBufferWriter<byte>();
+        new SetupMessage().EncodePayload(new MoqWriter(payload));
+        var frame = new System.Buffers.ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.Setup, payload.WrittenSpan);
+        await outbound.WriteAsync(frame.WrittenMemory, completeWrites: false, ct);
+        return (inbound, outbound);
     }
 }
