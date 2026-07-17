@@ -118,13 +118,10 @@ public class PubSubFlowTests
         payloads.Should().Equal("f0", "f1", "f2");
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Subscribe_ThenObjectsFlow_OverRealQuic()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // the in-memory flow covers the logic where QUIC cannot run
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "the in-memory flow covers the logic where QUIC cannot run");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         CancellationToken ct = cts.Token;

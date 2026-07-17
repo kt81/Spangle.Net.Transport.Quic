@@ -39,13 +39,10 @@ public class PublisherSubscriberFacadeTests
         await RunFlowAndAssertAsync(serverConn, clientConn, cts.Token);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Facades_PublishAndSubscribe_OverRealQuic()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // the in-memory flow covers the logic where QUIC cannot run
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "the in-memory flow covers the logic where QUIC cannot run");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         IQuicTransport transport = MsQuicTransport.Shared;

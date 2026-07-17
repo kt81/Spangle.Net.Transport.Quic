@@ -17,30 +17,25 @@ public class MsQuicTransportTests
 {
     private static readonly SslApplicationProtocol Moq = new("moq-echo");
 
-    [Fact]
+    [SkippableFact]
     public void IsSupported_WhenRequiredByEnvironment_MustBeTrue()
     {
         // CI sets SPANGLE_REQUIRE_QUIC on jobs that must exercise the real backend
         // (e.g. Windows, where msquic is in-box). Without this, every job could silently
         // skip the loopback test and the suite would go green having never touched msquic.
         string? require = Environment.GetEnvironmentVariable("SPANGLE_REQUIRE_QUIC");
-        if (!string.Equals(require, "1", StringComparison.Ordinal)
-            && !string.Equals(require, "true", StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
+        Skip.If(!string.Equals(require, "1", StringComparison.Ordinal)
+                && !string.Equals(require, "true", StringComparison.OrdinalIgnoreCase),
+            "SPANGLE_REQUIRE_QUIC is not set; this canary only fires where the real backend is required.");
 
         MsQuicTransport.Shared.IsSupported.Should().BeTrue(
             "SPANGLE_REQUIRE_QUIC is set, so this platform must be able to run the real msquic backend");
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Unsupported_Platform_ThrowsPlatformNotSupported()
     {
-        if (MsQuicTransport.Shared.IsSupported)
-        {
-            return; // covered by the loopback test on supported platforms
-        }
+        Skip.If(MsQuicTransport.Shared.IsSupported, "covered by the loopback test on supported platforms");
 
         var options = new QuicServerOptions
         {
@@ -51,13 +46,11 @@ public class MsQuicTransportTests
         await act.Should().ThrowAsync<PlatformNotSupportedException>();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Loopback_RoundTripsAStream_WhenSupported()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // no msquic / no IPv6 here; see Unsupported_Platform_ThrowsPlatformNotSupported
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported,
+            "no msquic / no IPv6 here; see Unsupported_Platform_ThrowsPlatformNotSupported");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         CancellationToken ct = cts.Token;
@@ -101,13 +94,10 @@ public class MsQuicTransportTests
         received.Should().Equal(payload);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Loopback_ClientAcceptsServerOpenedStream_WhenSupported()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // covered by the in-memory backend where QUIC cannot run
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported, "covered by the in-memory backend where QUIC cannot run");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         CancellationToken ct = cts.Token;

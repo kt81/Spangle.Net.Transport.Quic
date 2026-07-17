@@ -20,13 +20,11 @@ public class MoqSessionOverMsQuicTests
 {
     private static readonly SslApplicationProtocol Alpn = new(MoqtConstants.Alpn);
 
-    [Fact]
+    [SkippableFact]
     public async Task Handshake_ExchangesSetupOptions_OverRealQuic()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // no msquic / no IPv6 here; the in-memory MoqSessionTests cover the logic
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported,
+            "no msquic / no IPv6 here; the in-memory MoqSessionTests cover the logic");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         CancellationToken ct = cts.Token;

@@ -17,13 +17,11 @@ public class SubgroupStreamOverMsQuicTests
 {
     private static readonly SslApplicationProtocol Alpn = new(MoqtConstants.Alpn);
 
-    [Fact]
+    [SkippableFact]
     public async Task SubgroupStream_RoundTripsObjects_OverRealQuic()
     {
-        if (!MsQuicTransport.Shared.IsSupported)
-        {
-            return; // in-memory SubgroupStreamTests cover the logic where QUIC cannot run
-        }
+        Skip.IfNot(MsQuicTransport.Shared.IsSupported,
+            "in-memory SubgroupStreamTests cover the logic where QUIC cannot run");
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         CancellationToken ct = cts.Token;
