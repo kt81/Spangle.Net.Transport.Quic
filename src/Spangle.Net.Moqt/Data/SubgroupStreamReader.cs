@@ -52,7 +52,7 @@ public sealed class SubgroupStreamReader
         ulong objectId = _first ? delta : _previousObjectId + delta + 1;
         _previousObjectId = objectId;
 
-        IReadOnlyList<MoqKeyValuePair> extensions = [];
+        IReadOnlyList<MoqKeyValuePair> properties = [];
         if (Header.HasProperties)
         {
             // Object Extension Headers: a byte-length-prefixed block of Key-Value-Pairs.
@@ -64,7 +64,7 @@ public sealed class SubgroupStreamReader
                         cancellationToken)
                     .ConfigureAwait(false);
                 var reader = new MoqReader(block);
-                extensions = KeyValuePairCodec.ReadList(ref reader);
+                properties = KeyValuePairCodec.ReadList(ref reader);
             }
         }
 
@@ -103,7 +103,7 @@ public sealed class SubgroupStreamReader
         }
 
         return new MoqObject(Header.GroupId, objectId, _resolvedSubgroupId, Header.PublisherPriority, status, payload,
-            extensions);
+            properties);
     }
 
     // The length arrives before the bytes it promises, so it is checked against the limit

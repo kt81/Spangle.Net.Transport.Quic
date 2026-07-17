@@ -120,7 +120,7 @@ public class SubgroupStreamTests
         };
         header.Type.Should().Be(0x15UL, "base 0x10 | properties 0x01 | explicit subgroup id 0x04");
 
-        MoqKeyValuePair[] extensions =
+        MoqKeyValuePair[] properties =
         [
             MoqKeyValuePair.Varint(0x0A, 0x00),                       // media type (even -> varint)
             MoqKeyValuePair.FromBytes(0x0D, [0x01, 0x64, 0x00, 0x1F]), // extradata (odd -> bytes)
@@ -130,8 +130,8 @@ public class SubgroupStreamTests
         await using IQuicStream outbound = await clientConn.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
         var writer = new SubgroupStreamWriter(outbound, header);
         await writer.WriteObjectAsync(
-            MoqObject.Normal(1, 0, 0, 10, Encoding.UTF8.GetBytes("frame0"), extensions), ct);
-        // An object with no extensions on the same stream still writes an (empty) block.
+            MoqObject.Normal(1, 0, 0, 10, Encoding.UTF8.GetBytes("frame0"), properties), ct);
+        // An object with no properties on the same stream still writes an (empty) block.
         await writer.WriteObjectAsync(MoqObject.Normal(1, 1, 0, 10, Encoding.UTF8.GetBytes("frame1")), ct);
         await writer.CompleteAsync(ct);
 
@@ -142,19 +142,19 @@ public class SubgroupStreamTests
         MoqObject? first = await reader.ReadObjectAsync(ct);
         first.Should().NotBeNull();
         Encoding.UTF8.GetString(first!.Payload.Span).Should().Be("frame0");
-        first.Extensions.Should().HaveCount(3);
-        first.Extensions[0].Type.Should().Be(0x0AUL);
-        first.Extensions[0].IsBytes.Should().BeFalse();
-        first.Extensions[0].VarintValue.Should().Be(0x00UL);
-        first.Extensions[1].Type.Should().Be(0x0DUL);
-        first.Extensions[1].Bytes.ToArray().Should().Equal([0x01, 0x64, 0x00, 0x1F]);
-        first.Extensions[2].Type.Should().Be(0x15UL);
-        first.Extensions[2].Bytes.ToArray().Should().Equal([0x00, 0x2A, 0x2A]);
+        first.Properties.Should().HaveCount(3);
+        first.Properties[0].Type.Should().Be(0x0AUL);
+        first.Properties[0].IsBytes.Should().BeFalse();
+        first.Properties[0].VarintValue.Should().Be(0x00UL);
+        first.Properties[1].Type.Should().Be(0x0DUL);
+        first.Properties[1].Bytes.ToArray().Should().Equal([0x01, 0x64, 0x00, 0x1F]);
+        first.Properties[2].Type.Should().Be(0x15UL);
+        first.Properties[2].Bytes.ToArray().Should().Equal([0x00, 0x2A, 0x2A]);
 
         MoqObject? second = await reader.ReadObjectAsync(ct);
         second.Should().NotBeNull();
         Encoding.UTF8.GetString(second!.Payload.Span).Should().Be("frame1");
-        second.Extensions.Should().BeEmpty("an empty block round-trips as no extensions");
+        second.Properties.Should().BeEmpty("an empty block round-trips as no properties");
 
         (await reader.ReadObjectAsync(ct)).Should().BeNull();
     }

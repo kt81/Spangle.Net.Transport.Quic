@@ -63,7 +63,7 @@ public sealed class FetchStreamWriter
         ulong? objectIdDelta = ComputeObjectIdDelta(moqObject.ObjectId, first, groupIdDelta.HasValue);
         FetchSubgroupMode subgroupMode = ChooseSubgroupMode(moqObject.SubgroupId, isDatagram);
         bool hasPriority = _priorPriority is null || moqObject.PublisherPriority != _priorPriority.Value;
-        bool hasProperties = moqObject.Extensions.Count > 0;
+        bool hasProperties = moqObject.Properties.Count > 0;
 
         FetchObjectFlags flags = FetchObjectFlags.Compose(subgroupMode, objectIdDelta.HasValue,
             groupIdDelta.HasValue, hasPriority, hasProperties, isDatagram);
@@ -98,7 +98,7 @@ public sealed class FetchStreamWriter
             // Object Properties: a byte-length-prefixed block of Key-Value-Pairs whose types are
             // delta-encoded, so the block must be in non-decreasing type order.
             var properties = new ArrayBufferWriter<byte>();
-            KeyValuePairCodec.WriteList(new MoqWriter(properties), [.. moqObject.Extensions.OrderBy(p => p.Type)]);
+            KeyValuePairCodec.WriteList(new MoqWriter(properties), [.. moqObject.Properties.OrderBy(p => p.Type)]);
             writer.WriteVarInt((ulong)properties.WrittenCount);
             buffer.Write(properties.WrittenSpan);
         }

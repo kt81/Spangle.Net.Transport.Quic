@@ -150,14 +150,14 @@ public class FetchStreamTests
         await using IQuicStream outbound = await pair.Client.OpenStreamAsync(QuicStreamDirection.Unidirectional, ct);
         var writer = new FetchStreamWriter(outbound, new FetchHeader(11));
 
-        MoqKeyValuePair[] extensions = [MoqKeyValuePair.Varint(0x0A, 1), MoqKeyValuePair.FromBytes(0x0D, [0xAB])];
+        MoqKeyValuePair[] properties = [MoqKeyValuePair.Varint(0x0A, 1), MoqKeyValuePair.FromBytes(0x0D, [0xAB])];
 
         await writer.WriteObjectAsync(MoqObject.Normal(2, 0, 5, 10, Encoding.UTF8.GetBytes("a")), ct);
         await writer.WriteObjectAsync(MoqObject.Normal(2, 1, 5, 10, Encoding.UTF8.GetBytes("b")), ct);   // all inherited
         await writer.WriteObjectAsync(MoqObject.Normal(2, 9, 6, 10, Encoding.UTF8.GetBytes("c")), ct);   // id gap, subgroup+1
         await writer.WriteObjectAsync(MoqObject.Normal(2, 10, 0, 99, Encoding.UTF8.GetBytes("d")), ct);  // subgroup 0, new priority
         await writer.WriteObjectAsync(
-            MoqObject.Normal(5, 0, 5, 99, Encoding.UTF8.GetBytes("e"), extensions), ct);                 // group jump + properties
+            MoqObject.Normal(5, 0, 5, 99, Encoding.UTF8.GetBytes("e"), properties), ct);                 // group jump + properties
         await writer.CompleteAsync(ct);
 
         await using IQuicStream inbound = await pair.Peer.AcceptStreamAsync(ct);
@@ -176,10 +176,10 @@ public class FetchStreamTests
         objects.Select(o => o.PublisherPriority).Should().Equal([(byte)10, (byte)10, (byte)10, (byte)99, (byte)99]);
         objects.Select(o => Encoding.UTF8.GetString(o.Payload.Span)).Should().Equal(["a", "b", "c", "d", "e"]);
 
-        objects[0].Extensions.Should().BeEmpty();
-        objects[4].Extensions.Should().HaveCount(2);
-        objects[4].Extensions[0].VarintValue.Should().Be(1UL);
-        objects[4].Extensions[1].Bytes.ToArray().Should().Equal([0xAB]);
+        objects[0].Properties.Should().BeEmpty();
+        objects[4].Properties.Should().HaveCount(2);
+        objects[4].Properties[0].VarintValue.Should().Be(1UL);
+        objects[4].Properties[1].Bytes.ToArray().Should().Equal([0xAB]);
     }
 
     [Fact]

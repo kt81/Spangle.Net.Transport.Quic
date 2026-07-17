@@ -107,7 +107,7 @@ public sealed class FetchStreamReader
                        ?? throw new MoqProtocolException("The first object on a FETCH stream must set its Priority.");
         }
 
-        IReadOnlyList<MoqKeyValuePair> extensions = [];
+        IReadOnlyList<MoqKeyValuePair> properties = [];
         if (flags.HasProperties)
         {
             ulong propertiesLength = await StreamIo.ReadVarIntAsync(_stream, cancellationToken).ConfigureAwait(false);
@@ -118,7 +118,7 @@ public sealed class FetchStreamReader
                         cancellationToken)
                     .ConfigureAwait(false);
                 var reader = new MoqReader(block);
-                extensions = KeyValuePairCodec.ReadList(ref reader);
+                properties = KeyValuePairCodec.ReadList(ref reader);
             }
         }
 
@@ -140,7 +140,7 @@ public sealed class FetchStreamReader
         }
 
         return new MoqFetchedObject(new MoqObject(groupId, objectId, subgroupId, priority, MoqObjectStatus.Normal,
-            payload, extensions,
+            payload, properties,
             flags.IsDatagram ? MoqForwardingPreference.Datagram : MoqForwardingPreference.Subgroup));
     }
 

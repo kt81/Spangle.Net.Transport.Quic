@@ -59,10 +59,10 @@ public sealed class SubgroupStreamWriter
         {
             // Object Extension Headers: a byte-length-prefixed block of Key-Value-Pairs. Their
             // types are delta-encoded, so the block must be in non-decreasing type order.
-            var extensions = new ArrayBufferWriter<byte>();
-            KeyValuePairCodec.WriteList(new MoqWriter(extensions), [.. moqObject.Extensions.OrderBy(p => p.Type)]);
-            writer.WriteVarInt((ulong)extensions.WrittenCount);
-            buffer.Write(extensions.WrittenSpan);
+            var properties = new ArrayBufferWriter<byte>();
+            KeyValuePairCodec.WriteList(new MoqWriter(properties), [.. moqObject.Properties.OrderBy(p => p.Type)]);
+            writer.WriteVarInt((ulong)properties.WrittenCount);
+            buffer.Write(properties.WrittenSpan);
         }
 
         writer.WriteVarInt((ulong)moqObject.Payload.Length);

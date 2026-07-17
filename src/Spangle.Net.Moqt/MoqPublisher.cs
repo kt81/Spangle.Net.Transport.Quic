@@ -256,7 +256,7 @@ public sealed class MoqPublishedTrack
     /// <summary>
     /// Opens a subgroup stream and returns a writer for its objects, awaiting the first subscriber
     /// if none has arrived yet. Dispose or complete the returned writer when the subgroup is done.
-    /// Set <paramref name="hasExtensions"/> when the objects carry Extension Headers — it selects
+    /// Set <paramref name="hasProperties"/> when the objects carry Extension Headers — it selects
     /// the header's Properties bit, which every object on the stream must then honour.
     /// <para>
     /// <paramref name="endOfGroup"/> sets the header's END_OF_GROUP bit, asserting that this
@@ -275,7 +275,7 @@ public sealed class MoqPublishedTrack
     [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
         Justification = "The opened stream is owned by the returned MoqGroupWriter and disposed there.")]
     public async ValueTask<MoqGroupWriter> BeginGroupAsync(ulong groupId, byte publisherPriority,
-        bool hasExtensions = false, bool endOfGroup = false, ulong subgroupId = 0,
+        bool hasProperties = false, bool endOfGroup = false, ulong subgroupId = 0,
         CancellationToken cancellationToken = default)
     {
         // _subscribed is this track's own TCS, completed by AttachSubscriber on the demux loop;
@@ -294,7 +294,7 @@ public sealed class MoqPublishedTrack
             GroupId = groupId,
             SubgroupIdMode = SubgroupIdMode.Explicit,
             SubgroupId = subgroupId,
-            HasProperties = hasExtensions,
+            HasProperties = hasProperties,
             EndOfGroup = endOfGroup,
             PublisherPriority = publisherPriority,
         };
@@ -328,13 +328,13 @@ public sealed class MoqGroupWriter : IAsyncDisposable
     /// <summary>
     /// Appends one object (with the group's priority and subgroup 0) to the stream, optionally
     /// carrying Extension Headers — which requires the group to have been opened with
-    /// <c>hasExtensions</c>.
+    /// <c>hasProperties</c>.
     /// </summary>
     public ValueTask WriteObjectAsync(ulong objectId, ReadOnlyMemory<byte> payload,
-        IReadOnlyList<MoqKeyValuePair>? extensions = null, CancellationToken cancellationToken = default) =>
+        IReadOnlyList<MoqKeyValuePair>? properties = null, CancellationToken cancellationToken = default) =>
         _writer.WriteObjectAsync(
             MoqObject.Normal(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority, payload,
-                extensions),
+                properties),
             cancellationToken);
 
     /// <summary>

@@ -5,15 +5,15 @@ namespace Spangle.Net.Moqt;
 /// <summary>
 /// A MOQT Object (draft-18 §2.1, §11.2.1): the atomic unit of media on a track. It is
 /// addressed by Group and Object id within a Subgroup, carries the publisher's priority and
-/// a status, an opaque payload the media layer fills, and optional Extension Headers. This is
+/// a status, an opaque payload the media layer fills, and optional Object Properties. This is
 /// the type the Spangle bridge produces (egress) and consumes (ingest) at the package boundary.
 /// </summary>
 public sealed class MoqObject
 {
-    /// <summary>Creates an object with the given coordinates, status, payload, and extensions.</summary>
+    /// <summary>Creates an object with the given coordinates, status, payload, and properties.</summary>
     public MoqObject(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
         MoqObjectStatus status, ReadOnlyMemory<byte> payload,
-        IReadOnlyList<MoqKeyValuePair>? extensions = null,
+        IReadOnlyList<MoqKeyValuePair>? properties = null,
         MoqForwardingPreference forwarding = MoqForwardingPreference.Subgroup)
     {
         if (status != MoqObjectStatus.Normal && !payload.IsEmpty)
@@ -27,7 +27,7 @@ public sealed class MoqObject
         PublisherPriority = publisherPriority;
         Status = status;
         Payload = payload;
-        Extensions = extensions ?? [];
+        Properties = properties ?? [];
         Forwarding = forwarding;
     }
 
@@ -50,12 +50,12 @@ public sealed class MoqObject
     public ReadOnlyMemory<byte> Payload { get; }
 
     /// <summary>
-    /// The object's Extension Headers as Key-Value-Pairs — where a media mapping carries its
-    /// per-frame metadata (draft-cenzano-moq-media-interop puts the media type, timestamps and
-    /// codec extradata here). Only written when the subgroup header's Properties bit is set;
-    /// empty otherwise.
+    /// The Object Properties as Key-Value-Pairs — where a media mapping carries its per-frame
+    /// metadata (draft-cenzano-moq-media-interop puts the media type, timestamps and codec
+    /// extradata here; older drafts called these Extension Headers, and LOC still does). Only
+    /// written when the subgroup header's Properties bit is set; empty otherwise.
     /// </summary>
-    public IReadOnlyList<MoqKeyValuePair> Extensions { get; }
+    public IReadOnlyList<MoqKeyValuePair> Properties { get; }
 
     /// <summary>
     /// How the publisher sends this object (draft-18 §11.2.1). It is a property of the individual
@@ -64,10 +64,10 @@ public sealed class MoqObject
     /// </summary>
     public MoqForwardingPreference Forwarding { get; }
 
-    /// <summary>A normal object carrying a payload and optional extension headers.</summary>
+    /// <summary>A normal object carrying a payload and optional Object Properties.</summary>
     public static MoqObject Normal(ulong groupId, ulong objectId, ulong subgroupId, byte publisherPriority,
-        ReadOnlyMemory<byte> payload, IReadOnlyList<MoqKeyValuePair>? extensions = null) =>
-        new(groupId, objectId, subgroupId, publisherPriority, MoqObjectStatus.Normal, payload, extensions);
+        ReadOnlyMemory<byte> payload, IReadOnlyList<MoqKeyValuePair>? properties = null) =>
+        new(groupId, objectId, subgroupId, publisherPriority, MoqObjectStatus.Normal, payload, properties);
 }
 
 /// <summary>
