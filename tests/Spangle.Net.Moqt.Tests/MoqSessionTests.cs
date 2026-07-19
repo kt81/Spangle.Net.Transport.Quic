@@ -198,6 +198,123 @@ public class MoqSessionTests
         (await act.Should().ThrowAsync<MoqProtocolException>()).WithMessage("*control stream*");
     }
 
+    /// <summary>
+    /// A server's <see cref="MoqSession.SendGoAwayAsync"/> reaches the peer's
+    /// <see cref="MoqSession.GoAwayReceived"/> with the URI and timeout it named — the send-side
+    /// counterpart of <see cref="GoAway_FromThePeer_SurfacesWithoutEndingTheSession"/> — and does
+    /// not end either session, since GOAWAY is a migration notice, not a hang-up.
+    /// </summary>
+    [Fact]
+    public async Task SendGoAway_FromAServer_ReachesThePeersGoAwayReceived()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (MoqSession client, MoqSession serverSession) = await EstablishSessionPairAsync(transport, server, ct);
+        await using (client)
+        await using (serverSession)
+        {
+            using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task clientRun = client.RunAsync(runCts.Token);
+
+            await serverSession.SendGoAwayAsync("https://relay.example/next", timeout: 30, ct);
+
+            GoAwayMessage goAway = await client.GoAwayReceived.WaitAsync(ct);
+            goAway.NewSessionUri.Should().Be("https://relay.example/next");
+            goAway.Timeout.Should().Be(30UL);
+            goAway.RequestId.Should().BeNull("a session-level GOAWAY migrates the whole session, not one request");
+            clientRun.IsCompleted.Should().BeFalse("GOAWAY announces migration; the session drains rather than dying");
+
+            await runCts.CancelAsync();
+            try
+            {
+                await clientRun;
+            }
+            catch (OperationCanceledException)
+            {
+                // cancelled once the GOAWAY is verified
+            }
+        }
+    }
+
+    /// <summary>
+    /// GOAWAY is once per session (§10.4): a second <see cref="MoqSession.SendGoAwayAsync"/> throws
+    /// rather than put a second migration notice on the wire.
+    /// </summary>
+    [Fact]
+    public async Task SendGoAway_Twice_Throws()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (MoqSession client, MoqSession serverSession) = await EstablishSessionPairAsync(transport, server, ct);
+        await using (client)
+        await using (serverSession)
+        {
+            await serverSession.SendGoAwayAsync(cancellationToken: ct);
+
+            Func<Task> again = async () => await serverSession.SendGoAwayAsync(cancellationToken: ct);
+            (await again.Should().ThrowAsync<InvalidOperationException>()).WithMessage("*once per session*");
+        }
+    }
+
+    /// <summary>
+    /// Only a server may direct a migration, so a client naming a New Session URI in GOAWAY throws
+    /// (§10.4) before anything reaches the wire — but a client GOAWAY with an empty URI is allowed,
+    /// which is why the guarded call leaves the once-per-session budget intact for it.
+    /// </summary>
+    [Fact]
+    public async Task SendGoAway_FromAClientWithANewSessionUri_Throws()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (MoqSession client, MoqSession serverSession) = await EstablishSessionPairAsync(transport, server, ct);
+        await using (client)
+        await using (serverSession)
+        {
+            Func<Task> act = async () => await client.SendGoAwayAsync("https://nope.example", cancellationToken: ct);
+            (await act.Should().ThrowAsync<InvalidOperationException>()).WithMessage("*server*");
+
+            // The URI was refused before the send committed, so the client may still send a
+            // zero-length GOAWAY of its own.
+            await client.SendGoAwayAsync(cancellationToken: ct);
+        }
+    }
+
+    // Establishes both ends of a session over a fresh connection pair: the client connects and the
+    // server accepts, each sending its SETUP. Both returned sessions own their connections.
+    private static async Task<(MoqSession Client, MoqSession Server)> EstablishSessionPairAsync(
+        InMemoryQuicTransport transport, IQuicServer server, CancellationToken ct)
+    {
+        (IQuicConnection clientConn, IQuicConnection serverConn) = await ConnectPairAsync(transport, server, ct);
+        Task<MoqSession> serverTask = MoqSession.AcceptAsync(serverConn, new SetupMessage(), cancellationToken: ct);
+        MoqSession client = await MoqSession.ConnectAsync(clientConn, new SetupMessage(), cancellationToken: ct);
+        MoqSession serverSession = await serverTask;
+        return (client, serverSession);
+    }
+
     // The server side of the SETUP handshake by hand, so a test can then drive the control
     // stream itself: accept the client's control stream, read its SETUP, open ours, answer.
     private static async Task<(IQuicStream Inbound, IQuicStream Outbound)> HandshakeByHandAsync(

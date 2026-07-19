@@ -38,6 +38,7 @@ public sealed class MoqSession : IAsyncDisposable
     private Func<MoqRequestStream, CancellationToken, Task>? _requestHandler;
     private int _unclaimedStreams;
     private bool _runStarted;
+    private bool _goAwaySent;
 
     private MoqSession(IQuicConnection connection, IQuicStream outboundControl, IQuicStream inboundControl,
         SetupMessage localSetup, SetupMessage remoteSetup, bool isServer, MoqSessionOptions options)
@@ -70,6 +71,58 @@ public sealed class MoqSession : IAsyncDisposable
 #pragma warning disable VSTHRD003
     public Task<GoAwayMessage> GoAwayReceived => _goAwayReceived.Task;
 #pragma warning restore VSTHRD003
+
+    /// <summary>
+    /// Sends GOAWAY (§10.4) on this endpoint's own control stream: notice to the peer that this
+    /// session will close soon, so it should drain and reconnect — a server naming
+    /// <paramref name="newSessionUri"/> tells it where to. GOAWAY is the graceful-migration signal,
+    /// not a hang-up: after sending it this endpoint keeps serving — the demux loop runs on, and
+    /// requests and subscriptions already in flight continue to be answered and streamed — until it
+    /// (or the peer, once <paramref name="timeout"/> elapses) actually closes the session by
+    /// disposing it. The only thing the sender promises is that it will accept no <em>new</em>
+    /// requests.
+    /// <para>
+    /// §10.4 permits GOAWAY once per session; a second call throws. Only a server may direct a
+    /// migration, so a client MUST send a zero-length New Session URI — a non-empty one from the
+    /// client side throws rather than put an illegal frame on the wire. This mirrors the receive
+    /// side, <see cref="GoAwayReceived"/>, which is where the peer's GOAWAY surfaces.
+    /// </para>
+    /// </summary>
+    [SuppressMessage("Design", "CA1054:URI-like parameters should not be strings",
+        Justification = "The GOAWAY wire field is a length-prefixed string, empty in every client-sent " +
+                        "GOAWAY; System.Uri cannot represent that, matching GoAwayMessage.NewSessionUri.")]
+    public async Task SendGoAwayAsync(string? newSessionUri = null, ulong timeout = 0,
+        CancellationToken cancellationToken = default)
+    {
+        string uri = newSessionUri ?? string.Empty;
+        if (!IsServer && uri.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "Only a server may name a New Session URI in GOAWAY; a client MUST send a zero-length one (§10.4).");
+        }
+
+        lock (_stateLock)
+        {
+            if (_goAwaySent)
+            {
+                throw new InvalidOperationException(
+                    "GOAWAY has already been sent on this session; §10.4 allows it once per session.");
+            }
+
+            _goAwaySent = true;
+        }
+
+        var payload = new ArrayBufferWriter<byte>();
+        // A session-level GOAWAY carries no Request ID: that field migrates a single request and
+        // belongs only to a GOAWAY sent on a request stream (§10.4), not on the control stream.
+        new GoAwayMessage(uri, timeout).EncodePayload(new MoqWriter(payload));
+        var frame = new ArrayBufferWriter<byte>();
+        ControlMessage.Write(frame, MoqControlMessageType.GoAway, payload.WrittenSpan);
+        // completeWrites: false — the control stream is coterminous with the session (§3.3), so it
+        // stays open after GOAWAY; the session ends by being disposed, not by FINning it here.
+        await _outboundControl.WriteAsync(frame.WrittenMemory, completeWrites: false, cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     /// <summary>
     /// The underlying connection, on which the publisher/subscriber facades open request and
