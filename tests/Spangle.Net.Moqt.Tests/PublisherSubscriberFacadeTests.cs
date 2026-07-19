@@ -119,13 +119,65 @@ public class PublisherSubscriberFacadeTests
     }
 
     /// <summary>
-    /// A second subscription renames the track, and objects follow the new name. A relay
-    /// re-subscribes with a fresh Track Alias each time its own subscriber count rises from none —
-    /// so a publisher that kept using the first alias would answer every viewer after the first with
-    /// objects the relay has nowhere to put ("unknown track alias"), and they would see nothing.
+    /// Two concurrent subscriptions to one track each receive the same group's objects, on their
+    /// own Track Alias — the point of the fan-out: a track no longer serves the newest subscriber
+    /// alone but every one at once.
     /// </summary>
     [Fact]
-    public async Task ASecondSubscription_MovesTheTrackToItsNewAlias()
+    public async Task TwoSubscribers_ToOneTrack_EachReceiveTheSameGroup()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+        FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack published = publisher.PublishTrack(track);
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+        Task subRun = subSession.RunAsync(runCts.Token);
+
+        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
+        await using MoqSubscription first = await subscriber.SubscribeAsync(track, ct);
+        await using MoqSubscription second = await subscriber.SubscribeAsync(track, ct);
+        await WaitForConditionAsync(() => published.SubscriberCount == 2, ct);
+
+        Task<IReadOnlyList<string>> firstSide = CollectPayloadsAsync(first, expected: 2, ct);
+        Task<IReadOnlyList<string>> secondSide = CollectPayloadsAsync(second, expected: 2, ct);
+
+        await using (MoqGroupWriter g = await published.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct))
+        {
+            await g.WriteObjectAsync(0, Encoding.UTF8.GetBytes("o0"), cancellationToken: ct);
+            await g.WriteObjectAsync(1, Encoding.UTF8.GetBytes("o1"), cancellationToken: ct);
+            await g.CompleteAsync(ct);
+        }
+
+        (await firstSide).Should().Equal("o0", "o1");
+        (await secondSide).Should().Equal("o0", "o1");
+
+        await CancelAndDrainAsync(runCts, run, subRun);
+    }
+
+    /// <summary>
+    /// One subscriber's subgroup stream resetting mid-group costs only that subscriber — it is
+    /// dropped from the track and loses the group in flight — while the other keeps receiving the
+    /// rest of the group undisturbed. Driven by hand so the test holds the raw streams and can
+    /// abort one precisely.
+    /// </summary>
+    [Fact]
+    public async Task OneSubscribersStreamResetting_LeavesTheOtherUntouched()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         CancellationToken ct = cts.Token;
@@ -148,38 +200,105 @@ public class PublisherSubscriberFacadeTests
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task run = publisher.RunAsync(runCts.Token);
 
-        // Subscribed by hand: this test inspects the raw subgroup wire, which the session
-        // demux would otherwise claim.
-        (ulong firstAlias, IQuicStream firstRequest) = await SubscribeByHandAsync(subSession, track, ct);
-        await using IQuicStream request1 = firstRequest;
-        (await published.WaitForSubscriberAsync().WaitAsync(ct)).Should().Be(firstAlias);
+        // Two SUBSCRIBEs by hand on one connection; the subscriber demux is not running here, so
+        // the test keeps the raw subgroup streams the publisher opens.
+        (ulong aliasA, IQuicStream requestA) = await SubscribeByHandAsync(subSession, track, ct);
+        await using IQuicStream reqA = requestA;
+        (ulong aliasB, IQuicStream requestB) = await SubscribeByHandAsync(subSession, track, ct);
+        await using IQuicStream reqB = requestB;
+        await WaitForConditionAsync(() => published.SubscriberCount == 2, ct);
 
-        // The same peer subscribes again, as a relay does when a new viewer arrives.
-        (ulong secondAlias, IQuicStream secondRequest) = await SubscribeByHandAsync(subSession, track, ct);
-        await using IQuicStream request2 = secondRequest;
-        secondAlias.Should().NotBe(firstAlias, "each subscription gets its own alias");
+        await using MoqGroupWriter group = await published.BeginGroupAsync(0, publisherPriority: 100,
+            cancellationToken: ct);
+        await group.WriteObjectAsync(0, Encoding.UTF8.GetBytes("o0"), cancellationToken: ct);
 
-        Task<SubgroupHeader> headerTask = FirstSubgroupHeaderAsync(clientConn, secondAlias, ct);
-        await using (MoqGroupWriter group = await published.BeginGroupAsync(0, publisherPriority: 100,
+        Dictionary<ulong, MoqSubgroupStream> streams =
+            await AcceptSubgroupStreamsAsync(clientConn, [aliasA, aliasB], ct);
+        MoqSubgroupStream a = streams[aliasA];
+        MoqSubgroupStream b = streams[aliasB];
+        (await a.Reader.ReadObjectAsync(ct))!.Payload.ToArray().Should().Equal("o0"u8.ToArray());
+        (await b.Reader.ReadObjectAsync(ct))!.Payload.ToArray().Should().Equal("o0"u8.ToArray());
+
+        // A resets its stream; the publisher meets the reset on its next write to A and drops A.
+        a.Stream.Abort(0);
+        await group.WriteObjectAsync(1, Encoding.UTF8.GetBytes("o1"), cancellationToken: ct);
+        await group.WriteObjectAsync(2, Encoding.UTF8.GetBytes("o2"), cancellationToken: ct);
+        await group.CompleteAsync(ct);
+
+        // B is undisturbed: it gets the rest of the group and its clean FIN.
+        (await b.Reader.ReadObjectAsync(ct))!.Payload.ToArray().Should().Equal("o1"u8.ToArray());
+        (await b.Reader.ReadObjectAsync(ct))!.Payload.ToArray().Should().Equal("o2"u8.ToArray());
+        (await b.Reader.ReadObjectAsync(ct)).Should().BeNull("the group FINs cleanly for the healthy subscriber");
+
+        await WaitForConditionAsync(() => published.SubscriberCount == 1, ct);
+        published.HasSubscriber.Should().BeTrue("the surviving subscriber is still attached");
+
+        await a.Stream.DisposeAsync();
+        await b.Stream.DisposeAsync();
+        await CancelAndDrainAsync(runCts, run);
+    }
+
+    /// <summary>
+    /// A subscriber that joins after a group has been published gets the groups that follow, not
+    /// the ones already gone: the group snapshots its subscribers when it begins, so a late arrival
+    /// is picked up by the next <see cref="MoqPublishedTrack.BeginGroupAsync"/>, never the current
+    /// one.
+    /// </summary>
+    [Fact]
+    public async Task ALateSubscriber_GetsSubsequentGroupsNotEarlierOnes()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        CancellationToken ct = cts.Token;
+        var transport = new InMemoryQuicTransport();
+        await using IQuicServer server = await transport.ListenAsync(new QuicServerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+            ApplicationProtocols = [Alpn],
+        }, ct);
+
+        (IQuicConnection serverConn, IQuicConnection clientConn) = await ConnectPairAsync(transport, server, ct);
+        FullTrackName track = FullTrackName.FromStrings(["live"], "video0");
+
+        Task<MoqSession> pubSessionTask = MoqSession.AcceptAsync(serverConn, Setup(), cancellationToken: ct);
+        await using MoqSession subSession = await MoqSession.ConnectAsync(clientConn, Setup(), cancellationToken: ct);
+        await using MoqSession pubSession = await pubSessionTask;
+
+        MoqPublisher publisher = MoqPublisher.Create(pubSession);
+        MoqPublishedTrack published = publisher.PublishTrack(track);
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task run = publisher.RunAsync(runCts.Token);
+        Task subRun = subSession.RunAsync(runCts.Token);
+
+        MoqSubscriber subscriber = MoqSubscriber.Create(subSession);
+        await using MoqSubscription early = await subscriber.SubscribeAsync(track, ct);
+        await WaitForConditionAsync(() => published.SubscriberCount == 1, ct);
+        Task<IReadOnlyList<(ulong Group, string Text)>> earlySide = CollectGroupObjectsAsync(early, expected: 2, ct);
+
+        // Group 0 is published while only the early subscriber is attached.
+        await using (MoqGroupWriter g0 = await published.BeginGroupAsync(0, publisherPriority: 100,
             cancellationToken: ct))
         {
-            await group.WriteObjectAsync(0, Encoding.UTF8.GetBytes("frame"), cancellationToken: ct);
-            await group.CompleteAsync(ct);
+            await g0.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g0"), cancellationToken: ct);
+            await g0.CompleteAsync(ct);
         }
 
-        SubgroupHeader header = await headerTask;
-        header.TrackAlias.Should().Be(secondAlias, "objects go where the newest subscription says");
-        published.CurrentAlias.Should().Be(secondAlias);
+        // The late subscriber joins only now.
+        await using MoqSubscription late = await subscriber.SubscribeAsync(track, ct);
+        await WaitForConditionAsync(() => published.SubscriberCount == 2, ct);
+        Task<IReadOnlyList<(ulong Group, string Text)>> lateSide = CollectGroupObjectsAsync(late, expected: 1, ct);
 
-        await runCts.CancelAsync();
-        try
+        // Group 1, now that both are attached.
+        await using (MoqGroupWriter g1 = await published.BeginGroupAsync(1, publisherPriority: 100,
+            cancellationToken: ct))
         {
-            await run;
+            await g1.WriteObjectAsync(0, Encoding.UTF8.GetBytes("g1"), cancellationToken: ct);
+            await g1.CompleteAsync(ct);
         }
-        catch (OperationCanceledException)
-        {
-            // the demux loop is cancelled once the flow is verified
-        }
+
+        (await earlySide).Should().Equal((0UL, "g0"), (1UL, "g1"));
+        (await lateSide).Should().Equal((1UL, "g1"));
+
+        await CancelAndDrainAsync(runCts, run, subRun);
     }
 
     /// <summary>
@@ -360,6 +479,83 @@ public class PublisherSubscriberFacadeTests
         }
 
         throw new InvalidOperationException("the subscription ended before an object arrived");
+    }
+
+    private static async Task<IReadOnlyList<string>> CollectPayloadsAsync(MoqSubscription subscription,
+        int expected, CancellationToken ct)
+    {
+        var payloads = new List<string>();
+        await foreach (MoqObject moqObject in subscription.ReadObjectsAsync(ct))
+        {
+            payloads.Add(Encoding.UTF8.GetString(moqObject.Payload.Span));
+            if (payloads.Count == expected)
+            {
+                break;
+            }
+        }
+
+        return payloads;
+    }
+
+    private static async Task<IReadOnlyList<(ulong Group, string Text)>> CollectGroupObjectsAsync(
+        MoqSubscription subscription, int expected, CancellationToken ct)
+    {
+        var objects = new List<(ulong, string)>();
+        await foreach (MoqObject moqObject in subscription.ReadObjectsAsync(ct))
+        {
+            objects.Add((moqObject.GroupId, Encoding.UTF8.GetString(moqObject.Payload.Span)));
+            if (objects.Count == expected)
+            {
+                break;
+            }
+        }
+
+        return objects;
+    }
+
+    // Accepts subgroup streams off a connection until one for each wanted alias has arrived — for a
+    // test that drives the raw wire without the session demux claiming the streams first.
+    private static async Task<Dictionary<ulong, MoqSubgroupStream>> AcceptSubgroupStreamsAsync(
+        IQuicConnection connection, IReadOnlyCollection<ulong> aliases, CancellationToken ct)
+    {
+        var streams = new Dictionary<ulong, MoqSubgroupStream>();
+        while (streams.Count < aliases.Count)
+        {
+            MoqIncomingStream incoming = await MoqStreamRouter.AcceptAsync(connection, cancellationToken: ct);
+            if (incoming is MoqSubgroupStream subgroup && aliases.Contains(subgroup.Reader.Header.TrackAlias))
+            {
+                streams[subgroup.Reader.Header.TrackAlias] = subgroup;
+            }
+        }
+
+        return streams;
+    }
+
+    // Spins until a condition holds — the deterministic wait for a fan-out step that lands on the
+    // publisher's own loop (a subscriber attaching or being dropped), which no single await pins.
+    private static async Task WaitForConditionAsync(Func<bool> condition, CancellationToken ct)
+    {
+        while (!condition())
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(TimeSpan.FromMilliseconds(10), ct);
+        }
+    }
+
+    private static async Task CancelAndDrainAsync(CancellationTokenSource runCts, params Task[] loops)
+    {
+        await runCts.CancelAsync();
+        foreach (Task loop in loops)
+        {
+            try
+            {
+                await loop;
+            }
+            catch (OperationCanceledException)
+            {
+                // the demux loops are cancelled once the flow is verified
+            }
+        }
     }
 
     /// <summary>

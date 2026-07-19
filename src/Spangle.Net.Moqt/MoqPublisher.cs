@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
+using System.Threading.Channels;
 using Spangle.Net.Moqt.Data;
 using Spangle.Net.Moqt.Messages;
 using Spangle.Net.Moqt.Wire;
@@ -14,10 +15,11 @@ namespace Spangle.Net.Moqt;
 /// unidirectional subgroup streams. This is the "the bridge just calls it" surface the Spangle
 /// media bridge drives for egress — it never touches a varint.
 /// <para>
-/// Scope (first cut): SUBSCRIBE-driven pull to <b>one</b> subscriber per track. No PUBLISH push
-/// (§10.10), no SUBSCRIBE_ERROR, no fan-out to multiple subscribers — enough for a single egress
-/// consumer or a relay upstream. The session owns the connection lifetime; this facade does not
-/// dispose it.
+/// Scope: SUBSCRIBE-driven pull, fanned out to any number of concurrent subscribers per track —
+/// each SUBSCRIBE gets its own Track Alias and its own subgroup streams, and every group a track
+/// publishes reaches all of them. No PUBLISH push (§10.10), and no SUBSCRIBE_ERROR beyond the
+/// "does not exist" reply. The session owns the connection lifetime; this facade does not dispose
+/// it.
 /// </para>
 /// </summary>
 public sealed class MoqPublisher
@@ -109,7 +111,8 @@ public sealed class MoqPublisher
     /// Registers this publisher as the session's request handler and runs the session's demux
     /// loop until cancellation: every SUBSCRIBE that matches a declared track is answered with
     /// SUBSCRIBE_OK carrying a newly assigned Track Alias, after which the track streams its
-    /// objects to that subscriber. A SUBSCRIBE for an unknown track is answered with
+    /// objects to that subscription alongside any others already attached. A SUBSCRIBE for an
+    /// unknown track is answered with
     /// REQUEST_ERROR ("does not exist") — a reset alone reads as a transient failure and
     /// invites the peer to retry forever.
     /// <para>
@@ -160,7 +163,9 @@ public sealed class MoqPublisher
 
         ulong alias = _nextAlias++;
         await WriteSubscribeOkAsync(request.Stream, alias, cancellationToken).ConfigureAwait(false);
-        track.AttachSubscriber(alias);
+        // The demux token bounds the subscriber's fan-out pump: when the session ends, the pump
+        // stops with it.
+        track.AttachSubscriber(alias, cancellationToken);
     }
 
     private static async Task WriteRequestErrorAsync(IQuicStream requestStream, CancellationToken cancellationToken)
@@ -204,16 +209,28 @@ public sealed class MoqPublisher
 }
 
 /// <summary>
-/// A track a <see cref="MoqPublisher"/> offers. Media is written group by group: each group opens
-/// its own subgroup stream (subgroup 0) tagged with the track's assigned alias. Writes block on
-/// the first subscriber, then flow; this cut targets one subscriber.
+/// A track a <see cref="MoqPublisher"/> offers, fanned out to every subscriber that asked for it.
+/// Media is written group by group (<see cref="BeginGroupAsync"/>); each group is delivered to
+/// every active subscription on its own subgroup stream, tagged with that subscription's Track
+/// Alias. Each subscription is served by its own pump, so the subscribers do not pace one another:
+/// a slow or stalled one falls behind on its own streams and, past a bounded backlog, is dropped —
+/// it never blocks the track or another subscriber (see <see cref="MoqGroupWriter"/>).
 /// </summary>
 public sealed class MoqPublishedTrack
 {
+    // How far one subscriber may fall behind — this many undelivered group boundaries and objects
+    // buffered for it — before it is dropped rather than allowed to stall the track. The buffer is
+    // per subscriber, so one slow consumer costs only its own backlog; the objects are already
+    // copied out of the caller's buffers, so what is held is bounded by this count, not by the
+    // producer's willingness to wait.
+    private const int MaxBufferedCommandsPerSubscriber = 1024;
+
     private readonly IQuicConnection _connection;
-    private readonly TaskCompletionSource<ulong> _subscribed =
+    private readonly Lock _lock = new();
+    private readonly List<PublishedSubscription> _subscribers = [];
+    private readonly TaskCompletionSource<ulong> _firstSubscriber =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private ulong _alias;
+    private Exception? _failed;
 
     internal MoqPublishedTrack(IQuicConnection connection, FullTrackName name)
     {
@@ -225,49 +242,100 @@ public sealed class MoqPublishedTrack
     public FullTrackName Name { get; }
 
     /// <summary>
-    /// Whether a subscriber has arrived, without waiting for one. A live publisher asks this: with
-    /// nobody subscribed there is nothing to do with a frame but drop it, and blocking on
-    /// <see cref="BeginGroupAsync"/> instead would stall the pipeline feeding it.
+    /// Whether at least one subscriber is currently attached, without waiting for one. A live
+    /// publisher asks this: with nobody subscribed there is nothing to do with a frame but drop it,
+    /// and blocking on <see cref="BeginGroupAsync"/> for the first subscriber would stall the
+    /// pipeline feeding it. It falls back to false once the last subscriber goes away.
     /// </summary>
-    public bool HasSubscriber => _subscribed.Task.IsCompletedSuccessfully;
+    public bool HasSubscriber
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _subscribers.Count > 0;
+            }
+        }
+    }
+
+    /// <summary>How many subscribers are attached right now.</summary>
+    public int SubscriberCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _subscribers.Count;
+            }
+        }
+    }
 
     /// <summary>
-    /// The Track Alias the objects of the next group will carry — the one the newest subscription
-    /// assigned. A relay re-subscribes with a fresh alias every time its own subscriber count goes
-    /// from none to one, and objects sent under the previous alias are objects it has nowhere to
-    /// put: it answers "unknown track alias" and the viewer sees nothing at all.
-    /// </summary>
-    public ulong CurrentAlias => Volatile.Read(ref _alias);
-
-    /// <summary>
-    /// Completes with the assigned Track Alias once a subscriber has subscribed to this track.
-    /// The bridge can await this to avoid producing groups no one will receive.
+    /// Completes with the Track Alias of the <em>first</em> subscriber once one has subscribed to
+    /// this track. The bridge can await this to avoid producing groups no one will receive; later
+    /// subscribers are picked up by the next <see cref="BeginGroupAsync"/> without re-arming it.
     /// </summary>
     // The TCS is completed by AttachSubscriber on this same object; handing its Task out is not
     // the foreign-task hazard VSTHRD003 warns about.
 #pragma warning disable VSTHRD003
-    public Task<ulong> WaitForSubscriberAsync() => _subscribed.Task;
+    public Task<ulong> WaitForSubscriberAsync() => _firstSubscriber.Task;
 #pragma warning restore VSTHRD003
 
     /// <summary>
-    /// Binds the track to the subscription that just arrived. Later subscriptions replace the alias
-    /// rather than being ignored: the first one completes the wait, but it is the newest that says
-    /// where objects go.
+    /// Attaches the subscription that just arrived and starts its fan-out pump. Every subscriber is
+    /// served independently: the pump opens a subgroup stream per group and writes that group's
+    /// objects to it at the subscriber's own pace.
     /// </summary>
-    internal void AttachSubscriber(ulong alias)
+    internal void AttachSubscriber(ulong alias, CancellationToken sessionToken)
     {
-        Volatile.Write(ref _alias, alias);
-        _subscribed.TrySetResult(alias);
+        var subscription = new PublishedSubscription(alias, MaxBufferedCommandsPerSubscriber);
+        lock (_lock)
+        {
+            if (_failed is not null)
+            {
+                // The publisher already stopped; this subscriber has nothing coming. (A SUBSCRIBE
+                // cannot normally land after the demux ends, so this is the belt-and-suspenders
+                // path.)
+                subscription.Commands.Writer.TryComplete();
+                return;
+            }
+
+            _subscribers.Add(subscription);
+        }
+
+        _firstSubscriber.TrySetResult(alias);
+        _ = PumpSubscriberAsync(subscription, sessionToken);
     }
 
-    /// <summary>Ends the wait for a subscriber: none can arrive now, so waiting is not an option.</summary>
-    internal void FailSubscribers(Exception reason) => _subscribed.TrySetException(reason);
+    /// <summary>Ends the wait for a subscriber and stops every pump: none can arrive or continue now.</summary>
+    internal void FailSubscribers(Exception reason)
+    {
+        List<PublishedSubscription> stopping;
+        lock (_lock)
+        {
+            _failed ??= reason;
+            stopping = [.. _subscribers];
+            _subscribers.Clear();
+        }
+
+        _firstSubscriber.TrySetException(reason);
+        foreach (PublishedSubscription subscription in stopping)
+        {
+            subscription.Drop();
+        }
+    }
 
     /// <summary>
-    /// Opens a subgroup stream and returns a writer for its objects, awaiting the first subscriber
-    /// if none has arrived yet. Dispose or complete the returned writer when the subgroup is done.
+    /// Begins a group and returns a writer that fans its objects out to every subscriber attached
+    /// right now — each on its own subgroup stream, tagged with its own Track Alias. A subscriber
+    /// that joins after this call is not on this group but is picked up by the next one. Awaits the
+    /// first subscriber if none has ever arrived; once one has, this no longer blocks (a group with
+    /// no current subscribers is written to nobody). Dispose or complete the returned writer when
+    /// the subgroup is done.
+    /// <para>
     /// Set <paramref name="hasProperties"/> when the objects carry Extension Headers — it selects
     /// the header's Properties bit, which every object on the stream must then honour.
+    /// </para>
     /// <para>
     /// <paramref name="endOfGroup"/> sets the header's END_OF_GROUP bit, asserting that this
     /// subgroup holds the group's largest Object — so on FIN the group is complete. It is worth
@@ -279,91 +347,359 @@ public sealed class MoqPublishedTrack
     /// </para>
     /// <para>
     /// <paramref name="subgroupId"/> distinguishes concurrent subgroups within one group. Leave it
-    /// at 0 for one-subgroup-per-group; a publisher that opens several must give each its own.
+    /// at 0 for one-subgroup-per-group; a publisher that opens several must give each its own. A
+    /// track writes one group at a time: begin it, write its objects, complete it, then begin the
+    /// next.
     /// </para>
     /// </summary>
-    [SuppressMessage("Reliability", "CA2000:Dispose objects before losing scope",
-        Justification = "The opened stream is owned by the returned MoqGroupWriter and disposed there.")]
     public async ValueTask<MoqGroupWriter> BeginGroupAsync(ulong groupId, byte publisherPriority,
         bool hasProperties = false, bool endOfGroup = false, ulong subgroupId = 0,
         CancellationToken cancellationToken = default)
     {
-        // _subscribed is this track's own TCS, completed by AttachSubscriber on the demux loop;
-        // awaiting it is not the foreign-task deadlock hazard VSTHRD003 guards against.
+        // _firstSubscriber is this track's own TCS, completed by AttachSubscriber on the demux
+        // loop; awaiting it is not the foreign-task deadlock hazard VSTHRD003 guards against.
 #pragma warning disable VSTHRD003
-        await _subscribed.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _firstSubscriber.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
 #pragma warning restore VSTHRD003
-        // Read the alias per group rather than taking the one the wait returned: a track outlives
-        // its subscriptions, and each new one renames it.
-        ulong alias = CurrentAlias;
-        IQuicStream stream = await _connection
-            .OpenStreamAsync(QuicStreamDirection.Unidirectional, cancellationToken).ConfigureAwait(false);
-        var header = new SubgroupHeader
+
+        PublishedSubscription[] snapshot;
+        lock (_lock)
         {
-            TrackAlias = alias,
-            GroupId = groupId,
-            SubgroupIdMode = SubgroupIdMode.Explicit,
-            SubgroupId = subgroupId,
-            HasProperties = hasProperties,
-            EndOfGroup = endOfGroup,
-            PublisherPriority = publisherPriority,
-        };
-        return new MoqGroupWriter(stream, header);
+            snapshot = [.. _subscribers];
+        }
+
+        var lanes = new List<PublishedSubscription>(snapshot.Length);
+        foreach (PublishedSubscription subscription in snapshot)
+        {
+            var header = new SubgroupHeader
+            {
+                TrackAlias = subscription.Alias,
+                GroupId = groupId,
+                SubgroupIdMode = SubgroupIdMode.Explicit,
+                SubgroupId = subgroupId,
+                HasProperties = hasProperties,
+                EndOfGroup = endOfGroup,
+                PublisherPriority = publisherPriority,
+            };
+            if (subscription.Commands.Writer.TryWrite(GroupCommand.Begin(header)))
+            {
+                lanes.Add(subscription);
+            }
+            else
+            {
+                // Already this far behind at a group boundary: drop it rather than let it stall.
+                DropSubscriber(subscription);
+            }
+        }
+
+        return new MoqGroupWriter(this, lanes, groupId, subgroupId, publisherPriority);
+    }
+
+    // Hands one group command to every lane that is still keeping up. A lane whose buffer is full
+    // has fallen too far behind and is dropped; the others are untouched, so no subscriber's
+    // backlog is any other subscriber's problem.
+    internal void Deliver(IReadOnlyList<PublishedSubscription> lanes, GroupCommand command)
+    {
+        foreach (PublishedSubscription lane in lanes)
+        {
+            if (lane.IsDropped)
+            {
+                continue;
+            }
+
+            if (!lane.Commands.Writer.TryWrite(command))
+            {
+                DropSubscriber(lane);
+            }
+        }
+    }
+
+    private void DropSubscriber(PublishedSubscription subscription)
+    {
+        lock (_lock)
+        {
+            _subscribers.Remove(subscription);
+        }
+
+        subscription.Drop();
+    }
+
+    // One subscriber's fan-out pump, for the life of the subscription: it turns the group commands
+    // the track hands it into subgroup streams, one group at a time, at this subscriber's own pace.
+    // A reset, an abort, or falling too far behind ends only this pump — the subscriber loses its
+    // place on the track and at most the group in flight, never the track or another subscriber.
+    private async Task PumpSubscriberAsync(PublishedSubscription subscription, CancellationToken sessionToken)
+    {
+        IQuicStream? stream = null;
+        SubgroupStreamWriter? writer = null;
+        try
+        {
+            await foreach (GroupCommand command in subscription.Commands.Reader
+                               .ReadAllAsync(sessionToken).ConfigureAwait(false))
+            {
+                switch (command.Kind)
+                {
+                    case GroupCommandKind.Begin:
+                        if (stream is not null)
+                        {
+                            await DisposeQuietlyAsync(stream).ConfigureAwait(false);
+                        }
+
+                        stream = await _connection
+                            .OpenStreamAsync(QuicStreamDirection.Unidirectional, sessionToken).ConfigureAwait(false);
+                        subscription.SetCurrentStream(stream);
+                        writer = new SubgroupStreamWriter(stream, command.Header);
+                        break;
+                    case GroupCommandKind.Object:
+                        await writer!.WriteObjectAsync(command.Object!, sessionToken).ConfigureAwait(false);
+                        break;
+                    case GroupCommandKind.End:
+                        if (writer is not null)
+                        {
+                            await writer.CompleteAsync(sessionToken).ConfigureAwait(false);
+                        }
+
+                        if (stream is not null)
+                        {
+                            await stream.DisposeAsync().ConfigureAwait(false);
+                        }
+
+                        subscription.SetCurrentStream(null);
+                        stream = null;
+                        writer = null;
+                        break;
+                }
+            }
+        }
+#pragma warning disable CA1031 // any failure on this subscriber's streams stays this subscriber's
+        catch (Exception)
+        {
+            // The peer reset or aborted this subscription's stream, the connection went, or the
+            // subscriber fell far enough behind that DropSubscriber aborted its stream — and
+            // cancellation (the session ending) lands here too. In every case only this pump ends.
+        }
+#pragma warning restore CA1031
+        finally
+        {
+            subscription.SetCurrentStream(null);
+            if (stream is not null)
+            {
+                await DisposeQuietlyAsync(stream).ConfigureAwait(false);
+            }
+
+            DropSubscriber(subscription);
+        }
+    }
+
+    private static async ValueTask DisposeQuietlyAsync(IQuicStream stream)
+    {
+#pragma warning disable CA1031 // closing a stream the peer already tore down is best-effort
+        try
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // best-effort by definition
+        }
+#pragma warning restore CA1031
     }
 }
 
+// One subscriber's slot on a track: its Track Alias and the bounded command queue its pump drains.
+// The current stream is tracked so a drop can abort it — unblocking a pump stalled on a write to a
+// slow subscriber, so the drop takes effect at once instead of waiting the stall out.
+internal sealed class PublishedSubscription
+{
+    private readonly Lock _streamLock = new();
+    private IQuicStream? _currentStream;
+    private int _dropped;
+
+    public PublishedSubscription(ulong alias, int bufferCapacity)
+    {
+        Alias = alias;
+        Commands = Channel.CreateBounded<GroupCommand>(new BoundedChannelOptions(bufferCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+    }
+
+    public ulong Alias { get; }
+
+    public Channel<GroupCommand> Commands { get; }
+
+    public bool IsDropped => Volatile.Read(ref _dropped) != 0;
+
+    public void SetCurrentStream(IQuicStream? stream)
+    {
+        lock (_streamLock)
+        {
+            _currentStream = stream;
+        }
+    }
+
+    // Stops taking commands and aborts the stream in flight, if any. Idempotent: the producer's
+    // drop path and the pump's own teardown may both call it.
+    public void Drop()
+    {
+        if (Interlocked.Exchange(ref _dropped, 1) != 0)
+        {
+            return;
+        }
+
+        Commands.Writer.TryComplete();
+        lock (_streamLock)
+        {
+            _currentStream?.Abort(0);
+        }
+    }
+}
+
+// What the track hands a subscriber's pump: begin a group's stream, write an object, or end the
+// group (FIN the stream). A per-object copy of the payload rides in the object, so the producer's
+// buffers are free the instant it enqueues.
+internal enum GroupCommandKind
+{
+    Begin,
+    Object,
+    End,
+}
+
+internal readonly struct GroupCommand
+{
+    private GroupCommand(GroupCommandKind kind, SubgroupHeader header, MoqObject? moqObject)
+    {
+        Kind = kind;
+        Header = header;
+        Object = moqObject;
+    }
+
+    public GroupCommandKind Kind { get; }
+
+    public SubgroupHeader Header { get; }
+
+    public MoqObject? Object { get; }
+
+    public static GroupCommand Begin(SubgroupHeader header) => new(GroupCommandKind.Begin, header, moqObject: null);
+
+    public static GroupCommand Write(MoqObject moqObject) =>
+        new(GroupCommandKind.Object, header: default, moqObject);
+
+    public static GroupCommand End() => new(GroupCommandKind.End, header: default, moqObject: null);
+}
+
 /// <summary>
-/// Writes the objects of one group onto a subgroup stream, then FINs it. Object IDs must strictly
-/// increase (the wire uses delta encoding). Obtain one from <see cref="MoqPublishedTrack.BeginGroupAsync"/>.
+/// Writes the objects of one group, fanning them out to every subscriber the group was begun for —
+/// each on its own subgroup stream, which is FINed when the group completes. Object IDs must
+/// strictly increase (the wire uses delta encoding). Obtain one from
+/// <see cref="MoqPublishedTrack.BeginGroupAsync"/>.
+/// <para>
+/// Delivery is handed to each subscriber's pump, so a call returns as soon as the object is queued,
+/// not when it reaches the wire; a slow subscriber never delays this writer or the others. Because
+/// the write is deferred, each object's payload (and properties) are copied here, so the caller's
+/// buffers are free to reuse the instant the call returns — the same guarantee a straight-to-wire
+/// write gave.
+/// </para>
 /// </summary>
 public sealed class MoqGroupWriter : IAsyncDisposable
 {
-    private readonly IQuicStream _stream;
-    private readonly SubgroupHeader _header;
-    private readonly SubgroupStreamWriter _writer;
+    private readonly MoqPublishedTrack _track;
+    private readonly IReadOnlyList<PublishedSubscription> _lanes;
+    private readonly byte _publisherPriority;
+    private ulong _previousObjectId;
+    private bool _firstObject = true;
+    private bool _completed;
 
-    internal MoqGroupWriter(IQuicStream stream, SubgroupHeader header)
+    internal MoqGroupWriter(MoqPublishedTrack track, IReadOnlyList<PublishedSubscription> lanes,
+        ulong groupId, ulong subgroupId, byte publisherPriority)
     {
-        _stream = stream;
-        _header = header;
-        _writer = new SubgroupStreamWriter(stream, header);
+        _track = track;
+        _lanes = lanes;
+        _publisherPriority = publisherPriority;
+        GroupId = groupId;
+        SubgroupId = subgroupId;
     }
 
     /// <summary>The group these objects belong to.</summary>
-    public ulong GroupId => _header.GroupId;
+    public ulong GroupId { get; }
 
     /// <summary>The subgroup within that group these objects are on.</summary>
-    public ulong SubgroupId => _header.SubgroupId;
+    public ulong SubgroupId { get; }
 
     /// <summary>
-    /// Appends one object (with the group's priority and subgroup 0) to the stream, optionally
-    /// carrying Extension Headers — which requires the group to have been opened with
+    /// Appends one object (with the group's priority and subgroup) to every subscriber's stream,
+    /// optionally carrying Extension Headers — which requires the group to have been opened with
     /// <c>hasProperties</c>.
     /// </summary>
     public ValueTask WriteObjectAsync(ulong objectId, ReadOnlyMemory<byte> payload,
-        IReadOnlyList<MoqKeyValuePair>? properties = null, CancellationToken cancellationToken = default) =>
-        _writer.WriteObjectAsync(
-            MoqObject.Normal(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority, payload,
-                properties),
-            cancellationToken);
+        IReadOnlyList<MoqKeyValuePair>? properties = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        NextObjectId(objectId);
+        IReadOnlyList<MoqKeyValuePair>? copiedProperties = properties is null ? null : [.. properties];
+        MoqObject moqObject = MoqObject.Normal(GroupId, objectId, SubgroupId, _publisherPriority,
+            payload.ToArray(), copiedProperties);
+        _track.Deliver(_lanes, GroupCommand.Write(moqObject));
+        return ValueTask.CompletedTask;
+    }
 
     /// <summary>
-    /// Appends a zero-length object with the End of Group status (§11.2.1.1): no object at or after
-    /// <paramref name="objectId"/> exists in the group. This says on the wire what the header's
-    /// END_OF_GROUP bit says in the header — which is what a publisher needs when it could not have
-    /// known the group was ending at the time it opened the stream, because the bit is written with
-    /// the header and the news arrives later.
+    /// Appends a zero-length object with the End of Group status (§11.2.1.1) to every subscriber's
+    /// stream: no object at or after <paramref name="objectId"/> exists in the group. This says on
+    /// the wire what the header's END_OF_GROUP bit says in the header — which is what a publisher
+    /// needs when it could not have known the group was ending at the time it opened the stream,
+    /// because the bit is written with the header and the news arrives later.
     /// </summary>
-    public ValueTask WriteEndOfGroupAsync(ulong objectId, CancellationToken cancellationToken = default) =>
-        _writer.WriteObjectAsync(
-            new MoqObject(_header.GroupId, objectId, _header.SubgroupId, _header.PublisherPriority,
-                MoqObjectStatus.EndOfGroup, ReadOnlyMemory<byte>.Empty),
-            cancellationToken);
+    public ValueTask WriteEndOfGroupAsync(ulong objectId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        NextObjectId(objectId);
+        var moqObject = new MoqObject(GroupId, objectId, SubgroupId, _publisherPriority,
+            MoqObjectStatus.EndOfGroup, ReadOnlyMemory<byte>.Empty);
+        _track.Deliver(_lanes, GroupCommand.Write(moqObject));
+        return ValueTask.CompletedTask;
+    }
 
-    /// <summary>FINs the subgroup stream, signalling the subgroup is complete.</summary>
-    public ValueTask CompleteAsync(CancellationToken cancellationToken = default) =>
-        _writer.CompleteAsync(cancellationToken);
+    /// <summary>FINs every subscriber's subgroup stream, signalling the subgroup is complete.</summary>
+    public ValueTask CompleteAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EndGroup();
+        return ValueTask.CompletedTask;
+    }
 
     /// <inheritdoc />
-    public ValueTask DisposeAsync() => _stream.DisposeAsync();
+    public ValueTask DisposeAsync()
+    {
+        EndGroup();
+        return ValueTask.CompletedTask;
+    }
+
+    // Delivers the group's end to every lane, once: each lane's pump FINs its subgroup stream.
+    private void EndGroup()
+    {
+        if (_completed)
+        {
+            return;
+        }
+
+        _completed = true;
+        _track.Deliver(_lanes, GroupCommand.End());
+    }
+
+    // The strictly-increasing-Object-ID rule the delta encoding needs, checked once for the whole
+    // fan-out rather than separately per lane, so a bad ID is the producer's error to see here and
+    // not a divergence between subscribers.
+    private void NextObjectId(ulong objectId)
+    {
+        if (!_firstObject && objectId <= _previousObjectId)
+        {
+            throw new ArgumentException("Object IDs must strictly increase within a subgroup.", nameof(objectId));
+        }
+
+        _previousObjectId = objectId;
+        _firstObject = false;
+    }
 }
