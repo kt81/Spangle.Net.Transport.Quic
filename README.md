@@ -67,11 +67,12 @@ switch (await MoqStreamRouter.AcceptAsync(connection, cancellationToken: ct))
 ```
 
 **Or above the wire entirely.** The session runs one demux loop
-(`MoqSession.RunAsync`) that pumps the control stream (GOAWAY surfaces on
-`session.GoAwayReceived`) and routes every incoming stream to its owner — so any number of
-subscriptions can share a session without racing each other for streams.
-[`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) registers itself as the request
-handler and answers subscriptions; [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs)
+(`MoqSession.RunAsync`) that pumps the control stream (an arriving GOAWAY surfaces on
+`session.GoAwayReceived`, and `session.SendGoAwayAsync` sends one) and routes every incoming
+stream to its owner — so any number of subscriptions can share a session without racing each
+other for streams. [`MoqPublisher`](src/Spangle.Net.Moqt/MoqPublisher.cs) registers itself as
+the request handler and answers subscriptions, fanning each published track out to every
+subscriber that asks for it; [`MoqSubscriber`](src/Spangle.Net.Moqt/MoqSubscriber.cs)
 asks for a track and reads the objects the demux delivers for its Track Alias. Neither the
 caller nor these facades touches a varint. Read bounds against a lying peer live in
 `MoqSessionOptions.ReadLimits`, given once at `ConnectAsync` / `AcceptAsync`.
